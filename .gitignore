@@ -3,6 +3,7 @@ frontend/node_modules/
 
 .env
 .env.*
+!.env.example
 
 artifacts/
 cache/
@@ -12,3 +13,7 @@ dist/
 frontend/dist/
 
 .DS_Store
+
+# Local project workspace
+*.md
+.project-local/
