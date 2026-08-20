@@ -34,10 +34,11 @@ contract FairJackPool is ReentrancyGuard {
     mapping(address => uint256) public sharesOf;
 
     enum GameState {
-        WaitingForValidatorCommit,
-        WaitingForPlayerReveal,
-        WaitingForValidatorReveal,
+        Created,
+        WaitingForCommits,
+        WaitingForReveals,
         PlayerTurn,
+        DealerTurn,
         Finished,
         Cancelled
     }
@@ -56,21 +57,28 @@ contract FairJackPool is ReentrancyGuard {
         GameState state;
 
         bytes32 playerCommit;
-
-        address validator;
-        bytes32 validatorCommit;
         bytes32 playerSecret;
-        bytes32 validatorSecret;
+        bool playerCommitted;
+        bool playerRevealed;
 
-        uint256 commitDeadline;
-        uint256 revealDeadline;
-        uint256 actionDeadline;
+        address[3] selectedValidators;
+        bytes32[3] validatorCommits;
+        bytes32[3] validatorSecrets;
+        bool[3] validatorCommitted;
+        bool[3] validatorRevealed;
+        uint8 commitCount;
+        uint8 revealCount;
 
         uint8[] playerCards;
         uint8[] dealerCards;
 
         bytes32 finalSeed;
-        uint256 nonce;
+        uint256 cardNonce;
+        bool[52] drawnCards;
+
+        uint256 commitDeadline;
+        uint256 revealDeadline;
+        uint256 actionDeadline;
     }
 
     mapping(address => ValidatorInfo) public validators;
@@ -82,6 +90,11 @@ contract FairJackPool is ReentrancyGuard {
     constructor(address tokenAddress) {
         if (tokenAddress == address(0)) revert InvalidTokenAddress();
         token = IERC20(tokenAddress);
+    }
+
+    /// @notice Returns the number of addresses ever added to the validator list.
+    function getValidatorCount() external view returns (uint256) {
+        return validatorList.length;
     }
 
     /// @notice Deposits wager tokens into the house pool and mints accounting shares.
