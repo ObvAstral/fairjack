@@ -28,6 +28,10 @@ contract FairJackPool is ReentrancyGuard {
     error InsufficientWithdrawableCollateral(uint256 available, uint256 requested);
     error InsufficientEligibleValidators(uint256 required, uint256 available);
     error ValidatorCapacityReached(address validator);
+    error BetBelowMinimum(uint256 minimum, uint256 provided);
+    error BetAboveMaximum(uint256 maximum, uint256 provided);
+    error InsufficientTokenAllowance(uint256 available, uint256 required);
+    error GameDoesNotExist(uint256 gameId);
 
     event PoolDeposit(address indexed user, uint256 amount, uint256 sharesMinted);
     event PoolWithdraw(address indexed user, uint256 amount, uint256 sharesBurned);
@@ -35,6 +39,18 @@ contract FairJackPool is ReentrancyGuard {
     event ValidatorUnregistered(address indexed validator, uint256 collateralReturned);
     event ValidatorCollateralAdded(address indexed validator, uint256 amount);
     event ValidatorCollateralWithdrawn(address indexed validator, uint256 amount);
+    event PoolGameStarted(
+        uint256 indexed gameId,
+        address indexed player,
+        uint256 bet,
+        uint256 maxPayout
+    );
+    event ValidatorsSelected(
+        uint256 indexed gameId,
+        address validator0,
+        address validator1,
+        address validator2
+    );
 
     IERC20 public token;
 
@@ -42,6 +58,9 @@ contract FairJackPool is ReentrancyGuard {
     uint256 public constant MIN_VALIDATOR_COLLATERAL = 100 ether;
     uint256 public constant VALIDATOR_COLLATERAL_PER_GAME = 100 ether;
     uint256 public constant MAX_VALIDATOR_ACTIVE_GAMES = 10;
+    uint256 public constant MIN_BET = 1 ether;
+    uint256 public constant MAX_BET = 100 ether;
+    uint256 public constant COMMIT_DURATION = 15 minutes;
 
     uint256 public poolBalance;
     uint256 public lockedLiquidity;
@@ -187,6 +206,96 @@ contract FairJackPool is ReentrancyGuard {
         emit ValidatorCollateralWithdrawn(msg.sender, amount);
     }
 
+    /// @notice Creates a pool-backed game before the player submits a commit.
+    function startPoolGame(uint256 bet)
+        external
+        nonReentrant
+        returns (uint256 gameId)
+    {
+        if (bet < MIN_BET) revert BetBelowMinimum(MIN_BET, bet);
+        if (bet > MAX_BET) revert BetAboveMaximum(MAX_BET, bet);
+
+        uint256 allowance = token.allowance(msg.sender, address(this));
+        if (allowance < bet) revert InsufficientTokenAllowance(allowance, bet);
+
+        uint256 balanceBefore = token.balanceOf(address(this));
+        token.safeTransferFrom(msg.sender, address(this), bet);
+        uint256 received = token.balanceOf(address(this)) - balanceBefore;
+        if (received != bet) revert UnsupportedTokenTransfer(bet, received);
+
+        uint256 maxPayout = bet * 2;
+        uint256 availableLiquidity = getAvailableLiquidity();
+        if (availableLiquidity < maxPayout) {
+            revert InsufficientAvailableLiquidity(availableLiquidity, maxPayout);
+        }
+
+        gameId = nextGameId;
+        ++nextGameId;
+
+        Game storage game = games[gameId];
+        game.player = msg.sender;
+        game.bet = bet;
+        game.maxPayout = maxPayout;
+        game.state = GameState.Created;
+
+        address[3] memory committee = _selectValidators(msg.sender, gameId);
+        for (uint256 index; index < COMMITTEE_SIZE; ++index) {
+            game.selectedValidators[index] = committee[index];
+            _reserveValidator(committee[index]);
+        }
+
+        lockedLiquidity += maxPayout;
+        game.commitDeadline = block.timestamp + COMMIT_DURATION;
+        game.state = GameState.WaitingForCommits;
+
+        emit PoolGameStarted(gameId, msg.sender, bet, maxPayout);
+        emit ValidatorsSelected(
+            gameId,
+            committee[0],
+            committee[1],
+            committee[2]
+        );
+    }
+
+    function getGameCore(uint256 gameId)
+        external
+        view
+        returns (
+            address player,
+            uint256 bet,
+            uint256 maxPayout,
+            GameState state
+        )
+    {
+        Game storage game = _getGame(gameId);
+        return (game.player, game.bet, game.maxPayout, game.state);
+    }
+
+    function getGameValidators(uint256 gameId)
+        external
+        view
+        returns (address[3] memory)
+    {
+        return _getGame(gameId).selectedValidators;
+    }
+
+    function getGameDeadlines(uint256 gameId)
+        external
+        view
+        returns (
+            uint256 commitDeadline,
+            uint256 revealDeadline,
+            uint256 actionDeadline
+        )
+    {
+        Game storage game = _getGame(gameId);
+        return (
+            game.commitDeadline,
+            game.revealDeadline,
+            game.actionDeadline
+        );
+    }
+
     /// @notice Deposits wager tokens into the house pool and mints accounting shares.
     /// @param amount Amount of tokens to deposit, expressed in token base units.
     function depositToHousePool(uint256 amount) external nonReentrant {
@@ -327,5 +436,10 @@ contract FairJackPool is ReentrancyGuard {
                 return;
             }
         }
+    }
+
+    function _getGame(uint256 gameId) internal view returns (Game storage game) {
+        game = games[gameId];
+        if (game.player == address(0)) revert GameDoesNotExist(gameId);
     }
 }
