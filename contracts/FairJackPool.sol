@@ -42,6 +42,7 @@ contract FairJackPool is ReentrancyGuard {
     error SecretDoesNotMatchCommit(address participant);
     error RandomnessNotReady();
     error DeckExhausted();
+    error InvalidCard(uint8 card);
 
     event PoolDeposit(address indexed user, uint256 amount, uint256 sharesMinted);
     event PoolWithdraw(address indexed user, uint256 amount, uint256 sharesBurned);
@@ -475,6 +476,16 @@ contract FairJackPool is ReentrancyGuard {
         return _getGame(gameId).drawnCards[card];
     }
 
+    function getPlayerScore(uint256 gameId) external view returns (uint256) {
+        uint8[] memory cards = _getGame(gameId).playerCards;
+        return _calculateHandScore(cards);
+    }
+
+    function getDealerScore(uint256 gameId) external view returns (uint256) {
+        uint8[] memory cards = _getGame(gameId).dealerCards;
+        return _calculateHandScore(cards);
+    }
+
     /// @notice Deposits wager tokens into the house pool and mints accounting shares.
     /// @param amount Amount of tokens to deposit, expressed in token base units.
     function depositToHousePool(uint256 amount) external nonReentrant {
@@ -644,6 +655,34 @@ contract FairJackPool is ReentrancyGuard {
                 game.drawnCards[card] = true;
                 return card;
             }
+        }
+    }
+
+    function _calculateHandScore(uint8[] memory cards)
+        internal
+        pure
+        returns (uint256 score)
+    {
+        uint256 aces;
+
+        for (uint256 index; index < cards.length; ++index) {
+            uint8 card = cards[index];
+            if (card >= 52) revert InvalidCard(card);
+
+            uint8 rank = card % 13;
+            if (rank == 0) {
+                score += 11;
+                ++aces;
+            } else if (rank >= 9) {
+                score += 10;
+            } else {
+                score += rank + 1;
+            }
+        }
+
+        while (score > 21 && aces > 0) {
+            score -= 10;
+            --aces;
         }
     }
 
