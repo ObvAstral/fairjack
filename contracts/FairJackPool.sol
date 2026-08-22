@@ -43,6 +43,7 @@ contract FairJackPool is ReentrancyGuard {
     error RandomnessNotReady();
     error DeckExhausted();
     error InvalidCard(uint8 card);
+    error PlayerAlreadyBust();
 
     event PoolDeposit(address indexed user, uint256 amount, uint256 sharesMinted);
     event PoolWithdraw(address indexed user, uint256 amount, uint256 sharesBurned);
@@ -74,6 +75,42 @@ contract FairJackPool is ReentrancyGuard {
         bool indexed isPlayer
     );
     event FinalSeedGenerated(uint256 indexed gameId, bytes32 finalSeed);
+    event CardDrawn(
+        uint256 indexed gameId,
+        bool indexed playerHand,
+        uint8 card,
+        uint256 handSize
+    );
+    event GameStarted(uint256 indexed gameId, address indexed player);
+    event PlayerHit(
+        uint256 indexed gameId,
+        uint8 card,
+        uint256 playerScore
+    );
+    event PlayerStand(uint256 indexed gameId, uint256 playerScore);
+    event DealerResolved(
+        uint256 indexed gameId,
+        uint256 dealerScore,
+        bool dealerBust
+    );
+    event GameFinished(
+        uint256 indexed gameId,
+        GameResult result,
+        uint256 payout,
+        uint256 playerScore,
+        uint256 dealerScore
+    );
+    event ValidatorSlashed(
+        uint256 indexed gameId,
+        address indexed validator,
+        uint256 amount
+    );
+    event GameCancelled(uint256 indexed gameId);
+    event TimeoutClaimed(
+        uint256 indexed gameId,
+        address indexed claimant,
+        GameState timedOutState
+    );
 
     IERC20 public token;
 
@@ -85,6 +122,7 @@ contract FairJackPool is ReentrancyGuard {
     uint256 public constant MAX_BET = 100 ether;
     uint256 public constant COMMIT_DURATION = 15 minutes;
     uint256 public constant REVEAL_DURATION = 15 minutes;
+    uint256 public constant ACTION_DURATION = 5 minutes;
 
     uint256 public poolBalance;
     uint256 public lockedLiquidity;
@@ -102,6 +140,13 @@ contract FairJackPool is ReentrancyGuard {
         Cancelled
     }
 
+    enum GameResult {
+        None,
+        PlayerWin,
+        DealerWin,
+        Push
+    }
+
     struct ValidatorInfo {
         bool registered;
         uint256 collateral;
@@ -114,6 +159,8 @@ contract FairJackPool is ReentrancyGuard {
         uint256 bet;
         uint256 maxPayout;
         GameState state;
+        GameResult result;
+        uint256 payout;
 
         bytes32 playerCommit;
         bytes32 playerSecret;
@@ -366,6 +413,51 @@ contract FairJackPool is ReentrancyGuard {
         return _commitmentFor(secret, gameId, participant);
     }
 
+    function hit(uint256 gameId) external nonReentrant {
+        Game storage game = _getGame(gameId);
+        _requireState(game, GameState.PlayerTurn);
+        _requireBeforeDeadline(game.actionDeadline);
+        if (msg.sender != game.player) revert NotGamePlayer(msg.sender);
+
+        uint8[] memory currentHand = game.playerCards;
+        if (_calculateHandScore(currentHand) > 21) revert PlayerAlreadyBust();
+
+        uint8 card = _drawCard(game);
+        game.playerCards.push(card);
+        uint8[] memory updatedHand = game.playerCards;
+        uint256 playerScore = _calculateHandScore(updatedHand);
+
+        emit CardDrawn(gameId, true, card, game.playerCards.length);
+        emit PlayerHit(gameId, card, playerScore);
+
+        if (playerScore > 21) {
+            uint8[] memory dealerHand = game.dealerCards;
+            _settleGame(
+                gameId,
+                game,
+                GameResult.DealerWin,
+                playerScore,
+                _calculateHandScore(dealerHand)
+            );
+        } else {
+            game.actionDeadline = block.timestamp + ACTION_DURATION;
+        }
+    }
+
+    function stand(uint256 gameId) external nonReentrant {
+        Game storage game = _getGame(gameId);
+        _requireState(game, GameState.PlayerTurn);
+        _requireBeforeDeadline(game.actionDeadline);
+        if (msg.sender != game.player) revert NotGamePlayer(msg.sender);
+
+        uint8[] memory playerHand = game.playerCards;
+        uint256 playerScore = _calculateHandScore(playerHand);
+        emit PlayerStand(gameId, playerScore);
+
+        game.state = GameState.DealerTurn;
+        _resolveDealer(gameId, game, playerScore);
+    }
+
     function getGameCore(uint256 gameId)
         external
         view
@@ -484,6 +576,15 @@ contract FairJackPool is ReentrancyGuard {
     function getDealerScore(uint256 gameId) external view returns (uint256) {
         uint8[] memory cards = _getGame(gameId).dealerCards;
         return _calculateHandScore(cards);
+    }
+
+    function getGameResult(uint256 gameId)
+        external
+        view
+        returns (GameResult result, uint256 payout)
+    {
+        Game storage game = _getGame(gameId);
+        return (game.result, game.payout);
     }
 
     /// @notice Deposits wager tokens into the house pool and mints accounting shares.
@@ -634,6 +735,7 @@ contract FairJackPool is ReentrancyGuard {
             );
 
             emit FinalSeedGenerated(gameId, game.finalSeed);
+            _dealInitialCards(gameId, game);
         }
     }
 
@@ -684,6 +786,105 @@ contract FairJackPool is ReentrancyGuard {
             score -= 10;
             --aces;
         }
+    }
+
+    function _dealInitialCards(uint256 gameId, Game storage game) private {
+        for (uint256 index; index < 2; ++index) {
+            uint8 playerCard = _drawCard(game);
+            game.playerCards.push(playerCard);
+            emit CardDrawn(
+                gameId,
+                true,
+                playerCard,
+                game.playerCards.length
+            );
+        }
+
+        for (uint256 index; index < 2; ++index) {
+            uint8 dealerCard = _drawCard(game);
+            game.dealerCards.push(dealerCard);
+            emit CardDrawn(
+                gameId,
+                false,
+                dealerCard,
+                game.dealerCards.length
+            );
+        }
+
+        game.state = GameState.PlayerTurn;
+        game.actionDeadline = block.timestamp + ACTION_DURATION;
+
+        emit GameStarted(gameId, game.player);
+    }
+
+    function _resolveDealer(
+        uint256 gameId,
+        Game storage game,
+        uint256 playerScore
+    ) private {
+        uint8[] memory dealerHand = game.dealerCards;
+        uint256 dealerScore = _calculateHandScore(dealerHand);
+
+        while (dealerScore < 17) {
+            uint8 card = _drawCard(game);
+            game.dealerCards.push(card);
+            dealerHand = game.dealerCards;
+            dealerScore = _calculateHandScore(dealerHand);
+            emit CardDrawn(gameId, false, card, game.dealerCards.length);
+        }
+
+        bool dealerBust = dealerScore > 21;
+        emit DealerResolved(gameId, dealerScore, dealerBust);
+
+        GameResult result;
+        if (dealerBust || playerScore > dealerScore) {
+            result = GameResult.PlayerWin;
+        } else if (dealerScore > playerScore) {
+            result = GameResult.DealerWin;
+        } else {
+            result = GameResult.Push;
+        }
+
+        _settleGame(gameId, game, result, playerScore, dealerScore);
+    }
+
+    function _settleGame(
+        uint256 gameId,
+        Game storage game,
+        GameResult result,
+        uint256 playerScore,
+        uint256 dealerScore
+    ) private {
+        game.state = GameState.Finished;
+        game.result = result;
+        lockedLiquidity -= game.maxPayout;
+
+        for (uint256 index; index < COMMITTEE_SIZE; ++index) {
+            --validators[game.selectedValidators[index]].activeGames;
+        }
+
+        uint256 payout;
+        if (result == GameResult.PlayerWin) {
+            poolBalance -= game.bet;
+            payout = game.maxPayout;
+        } else if (result == GameResult.DealerWin) {
+            poolBalance += game.bet;
+        } else {
+            payout = game.bet;
+        }
+        game.payout = payout;
+
+        if (payout != 0) {
+            token.safeTransfer(game.player, payout);
+        }
+
+        emit GameFinished(
+            gameId,
+            result,
+            payout,
+            playerScore,
+            dealerScore
+        );
     }
 
     function _findValidator(Game storage game, address participant)
