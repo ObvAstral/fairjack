@@ -40,6 +40,8 @@ contract FairJackPool is ReentrancyGuard {
     error CommitAlreadySubmitted(address participant);
     error SecretAlreadyRevealed(address participant);
     error SecretDoesNotMatchCommit(address participant);
+    error RandomnessNotReady();
+    error DeckExhausted();
 
     event PoolDeposit(address indexed user, uint256 amount, uint256 sharesMinted);
     event PoolWithdraw(address indexed user, uint256 amount, uint256 sharesBurned);
@@ -444,6 +446,35 @@ contract FairJackPool is ReentrancyGuard {
         );
     }
 
+    function getPlayerCards(uint256 gameId)
+        external
+        view
+        returns (uint8[] memory)
+    {
+        return _getGame(gameId).playerCards;
+    }
+
+    function getDealerCards(uint256 gameId)
+        external
+        view
+        returns (uint8[] memory)
+    {
+        return _getGame(gameId).dealerCards;
+    }
+
+    function getCardNonce(uint256 gameId) external view returns (uint256) {
+        return _getGame(gameId).cardNonce;
+    }
+
+    function isCardDrawn(uint256 gameId, uint8 card)
+        external
+        view
+        returns (bool)
+    {
+        if (card >= 52) return false;
+        return _getGame(gameId).drawnCards[card];
+    }
+
     /// @notice Deposits wager tokens into the house pool and mints accounting shares.
     /// @param amount Amount of tokens to deposit, expressed in token base units.
     function depositToHousePool(uint256 amount) external nonReentrant {
@@ -592,6 +623,27 @@ contract FairJackPool is ReentrancyGuard {
             );
 
             emit FinalSeedGenerated(gameId, game.finalSeed);
+        }
+    }
+
+    function _drawCard(Game storage game) internal returns (uint8 card) {
+        if (game.finalSeed == bytes32(0)) revert RandomnessNotReady();
+        if (game.playerCards.length + game.dealerCards.length == 52) {
+            revert DeckExhausted();
+        }
+
+        while (true) {
+            card = uint8(
+                uint256(
+                    keccak256(abi.encode(game.finalSeed, game.cardNonce))
+                ) % 52
+            );
+            ++game.cardNonce;
+
+            if (!game.drawnCards[card]) {
+                game.drawnCards[card] = true;
+                return card;
+            }
         }
     }
 
