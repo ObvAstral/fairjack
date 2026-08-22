@@ -21,11 +21,27 @@ contract FairJackPool is ReentrancyGuard {
     error InsufficientShares(uint256 available, uint256 requested);
     error InsufficientAvailableLiquidity(uint256 available, uint256 requested);
     error UnsupportedTokenTransfer(uint256 expected, uint256 received);
+    error AlreadyRegisteredValidator();
+    error NotRegisteredValidator();
+    error InsufficientValidatorCollateral(uint256 minimum, uint256 provided);
+    error ValidatorHasActiveGames(uint256 activeGames);
+    error InsufficientWithdrawableCollateral(uint256 available, uint256 requested);
+    error InsufficientEligibleValidators(uint256 required, uint256 available);
+    error ValidatorCapacityReached(address validator);
 
     event PoolDeposit(address indexed user, uint256 amount, uint256 sharesMinted);
     event PoolWithdraw(address indexed user, uint256 amount, uint256 sharesBurned);
+    event ValidatorRegistered(address indexed validator, uint256 collateral);
+    event ValidatorUnregistered(address indexed validator, uint256 collateralReturned);
+    event ValidatorCollateralAdded(address indexed validator, uint256 amount);
+    event ValidatorCollateralWithdrawn(address indexed validator, uint256 amount);
 
     IERC20 public token;
+
+    uint256 public constant COMMITTEE_SIZE = 3;
+    uint256 public constant MIN_VALIDATOR_COLLATERAL = 100 ether;
+    uint256 public constant VALIDATOR_COLLATERAL_PER_GAME = 100 ether;
+    uint256 public constant MAX_VALIDATOR_ACTIVE_GAMES = 10;
 
     uint256 public poolBalance;
     uint256 public lockedLiquidity;
@@ -97,6 +113,80 @@ contract FairJackPool is ReentrancyGuard {
         return validatorList.length;
     }
 
+    /// @notice Opts the caller into validator selection and deposits collateral.
+    function registerAsValidator(uint256 collateral) external nonReentrant {
+        ValidatorInfo storage info = validators[msg.sender];
+        if (info.registered) revert AlreadyRegisteredValidator();
+        if (collateral < MIN_VALIDATOR_COLLATERAL) {
+            revert InsufficientValidatorCollateral(MIN_VALIDATOR_COLLATERAL, collateral);
+        }
+
+        uint256 balanceBefore = token.balanceOf(address(this));
+        token.safeTransferFrom(msg.sender, address(this), collateral);
+        uint256 received = token.balanceOf(address(this)) - balanceBefore;
+        if (received != collateral) revert UnsupportedTokenTransfer(collateral, received);
+
+        info.registered = true;
+        info.collateral = collateral;
+        validatorList.push(msg.sender);
+
+        emit ValidatorRegistered(msg.sender, collateral);
+    }
+
+    /// @notice Opts the caller out and returns all collateral when no game is active.
+    function unregisterAsValidator() external nonReentrant {
+        ValidatorInfo storage info = validators[msg.sender];
+        if (!info.registered) revert NotRegisteredValidator();
+        if (info.activeGames != 0) revert ValidatorHasActiveGames(info.activeGames);
+
+        uint256 collateral = info.collateral;
+        info.registered = false;
+        info.collateral = 0;
+        _removeValidator(msg.sender);
+
+        token.safeTransfer(msg.sender, collateral);
+
+        emit ValidatorUnregistered(msg.sender, collateral);
+    }
+
+    /// @notice Adds collateral to an already registered validator.
+    function addValidatorCollateral(uint256 amount) external nonReentrant {
+        if (amount == 0) revert ZeroAmount();
+
+        ValidatorInfo storage info = validators[msg.sender];
+        if (!info.registered) revert NotRegisteredValidator();
+
+        uint256 balanceBefore = token.balanceOf(address(this));
+        token.safeTransferFrom(msg.sender, address(this), amount);
+        uint256 received = token.balanceOf(address(this)) - balanceBefore;
+        if (received != amount) revert UnsupportedTokenTransfer(amount, received);
+
+        info.collateral += amount;
+
+        emit ValidatorCollateralAdded(msg.sender, amount);
+    }
+
+    /// @notice Withdraws collateral not required for registration or active games.
+    function withdrawValidatorCollateral(uint256 amount) external nonReentrant {
+        if (amount == 0) revert ZeroAmount();
+
+        ValidatorInfo storage info = validators[msg.sender];
+        if (!info.registered) revert NotRegisteredValidator();
+
+        uint256 requiredCollateral = _requiredValidatorCollateral(info.activeGames);
+        uint256 available = info.collateral > requiredCollateral
+            ? info.collateral - requiredCollateral
+            : 0;
+        if (amount > available) {
+            revert InsufficientWithdrawableCollateral(available, amount);
+        }
+
+        info.collateral -= amount;
+        token.safeTransfer(msg.sender, amount);
+
+        emit ValidatorCollateralWithdrawn(msg.sender, amount);
+    }
+
     /// @notice Deposits wager tokens into the house pool and mints accounting shares.
     /// @param amount Amount of tokens to deposit, expressed in token base units.
     function depositToHousePool(uint256 amount) external nonReentrant {
@@ -164,5 +254,78 @@ contract FairJackPool is ReentrancyGuard {
         }
 
         return (poolBalance * 1e18) / totalShares;
+    }
+
+    function _selectValidators(address player, uint256 selectionSalt)
+        internal
+        view
+        returns (address[3] memory committee)
+    {
+        uint256 validatorCount = validatorList.length;
+        if (validatorCount < COMMITTEE_SIZE) {
+            revert InsufficientEligibleValidators(COMMITTEE_SIZE, validatorCount);
+        }
+
+        uint256 startIndex = uint256(
+            keccak256(abi.encode(player, selectionSalt, address(this)))
+        ) % validatorCount;
+        uint256 selected;
+
+        for (uint256 offset; offset < validatorCount && selected < COMMITTEE_SIZE; ++offset) {
+            address candidate = validatorList[(startIndex + offset) % validatorCount];
+            ValidatorInfo storage info = validators[candidate];
+
+            if (
+                candidate != player && info.registered
+                    && info.activeGames < MAX_VALIDATOR_ACTIVE_GAMES
+                    && info.collateral
+                        >= (info.activeGames + 1) * VALIDATOR_COLLATERAL_PER_GAME
+            ) {
+                committee[selected] = candidate;
+                ++selected;
+            }
+        }
+
+        if (selected != COMMITTEE_SIZE) {
+            revert InsufficientEligibleValidators(COMMITTEE_SIZE, selected);
+        }
+    }
+
+    function _reserveValidator(address validator) internal {
+        ValidatorInfo storage info = validators[validator];
+        if (
+            !info.registered || info.activeGames >= MAX_VALIDATOR_ACTIVE_GAMES
+                || info.collateral
+                    < (info.activeGames + 1) * VALIDATOR_COLLATERAL_PER_GAME
+        ) {
+            revert ValidatorCapacityReached(validator);
+        }
+
+        ++info.activeGames;
+    }
+
+    function _requiredValidatorCollateral(uint256 activeGames)
+        internal
+        pure
+        returns (uint256)
+    {
+        uint256 activeRequirement = activeGames * VALIDATOR_COLLATERAL_PER_GAME;
+        return activeRequirement > MIN_VALIDATOR_COLLATERAL
+            ? activeRequirement
+            : MIN_VALIDATOR_COLLATERAL;
+    }
+
+    function _removeValidator(address validator) private {
+        uint256 validatorCount = validatorList.length;
+        for (uint256 index; index < validatorCount; ++index) {
+            if (validatorList[index] == validator) {
+                uint256 lastIndex = validatorCount - 1;
+                if (index != lastIndex) {
+                    validatorList[index] = validatorList[lastIndex];
+                }
+                validatorList.pop();
+                return;
+            }
+        }
     }
 }
