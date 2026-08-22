@@ -70,6 +70,7 @@ contract FairJackPool is ReentrancyGuard {
         address indexed participant,
         bool indexed isPlayer
     );
+    event FinalSeedGenerated(uint256 indexed gameId, bytes32 finalSeed);
 
     IERC20 public token;
 
@@ -327,6 +328,7 @@ contract FairJackPool is ReentrancyGuard {
         ++game.revealCount;
 
         emit SecretRevealed(gameId, msg.sender, true);
+        _generateFinalSeedIfReady(gameId, game);
     }
 
     function revealValidatorSecret(uint256 gameId, bytes32 secret) external {
@@ -350,6 +352,7 @@ contract FairJackPool is ReentrancyGuard {
         ++game.revealCount;
 
         emit SecretRevealed(gameId, msg.sender, false);
+        _generateFinalSeedIfReady(gameId, game);
     }
 
     function computeCommitment(
@@ -573,6 +576,23 @@ contract FairJackPool is ReentrancyGuard {
         return keccak256(
             abi.encode(secret, gameId, participant, address(this))
         );
+    }
+
+    function _generateFinalSeedIfReady(uint256 gameId, Game storage game) private {
+        if (game.revealCount == COMMITTEE_SIZE + 1) {
+            game.finalSeed = keccak256(
+                abi.encode(
+                    gameId,
+                    game.playerSecret,
+                    game.validatorSecrets[0],
+                    game.validatorSecrets[1],
+                    game.validatorSecrets[2],
+                    address(this)
+                )
+            );
+
+            emit FinalSeedGenerated(gameId, game.finalSeed);
+        }
     }
 
     function _findValidator(Game storage game, address participant)

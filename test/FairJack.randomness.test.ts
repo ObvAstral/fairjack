@@ -1,13 +1,17 @@
 import { expect } from "chai";
 import { network } from "hardhat";
-import { createCommit, createSecret } from "./helpers/cryptoHelpers.js";
+import {
+  createCommit,
+  createFinalSeed,
+  createSecret,
+} from "./helpers/cryptoHelpers.js";
 
 const { ethers, networkHelpers } = await network.create();
 const INITIAL_BALANCE = ethers.parseEther("10000");
 const MIN_COLLATERAL = ethers.parseEther("100");
 const BET = ethers.parseEther("25");
 
-describe("FairJackPool commit-reveal", function () {
+describe("FairJackPool randomness", function () {
   async function deployGameFixture() {
     const [staker, player, validatorA, validatorB, validatorC, outsider] =
       await ethers.getSigners();
@@ -30,7 +34,9 @@ describe("FairJackPool commit-reveal", function () {
       .connect(staker)
       .depositToHousePool(ethers.parseEther("1000"));
     for (const validator of [validatorA, validatorB, validatorC]) {
-      await pool.connect(validator).registerAsValidator(MIN_COLLATERAL);
+      await pool
+        .connect(validator)
+        .registerAsValidator(MIN_COLLATERAL * 2n);
     }
     await pool.connect(player).startPoolGame(BET);
 
@@ -53,35 +59,88 @@ describe("FairJackPool commit-reveal", function () {
       outsider,
       committee,
       committeeSigners,
+      signersByAddress,
     };
   }
 
-  async function prepareAllCommits() {
-    const fixture = await deployGameFixture();
+  type GameFixture = Awaited<ReturnType<typeof deployGameFixture>>;
+  type CommitteeSigners = GameFixture["committeeSigners"];
+
+  function createValidatorSecrets(): [string, string, string] {
+    return [createSecret(), createSecret(), createSecret()];
+  }
+
+  async function submitCommits(
+    fixture: GameFixture,
+    gameId: bigint,
+    playerSecret: string,
+    validatorSecrets: readonly [string, string, string],
+    committeeSigners: CommitteeSigners = fixture.committeeSigners,
+  ) {
     const contractAddress = await fixture.pool.getAddress();
-    const playerSecret = createSecret();
     const playerCommit = createCommit(
       playerSecret,
-      0n,
+      gameId,
       fixture.player.address,
       contractAddress,
     );
-    const validatorSecrets = fixture.committeeSigners.map(() => createSecret());
-    const validatorCommits = fixture.committeeSigners.map((validator, index) =>
+    const validatorCommits = committeeSigners.map((validator, index) =>
       createCommit(
         validatorSecrets[index],
-        0n,
+        gameId,
         validator.address,
         contractAddress,
       ),
     );
 
-    await fixture.pool.connect(fixture.player).submitPlayerCommit(0n, playerCommit);
-    for (let index = 0; index < fixture.committeeSigners.length; ++index) {
+    await fixture.pool
+      .connect(fixture.player)
+      .submitPlayerCommit(gameId, playerCommit);
+    for (let index = 0; index < committeeSigners.length; ++index) {
       await fixture.pool
-        .connect(fixture.committeeSigners[index])
-        .submitValidatorCommit(0n, validatorCommits[index]);
+        .connect(committeeSigners[index])
+        .submitValidatorCommit(gameId, validatorCommits[index]);
     }
+
+    return { playerCommit, validatorCommits };
+  }
+
+  async function revealSecrets(
+    fixture: GameFixture,
+    gameId: bigint,
+    playerSecret: string,
+    validatorSecrets: readonly [string, string, string],
+    committeeSigners: CommitteeSigners = fixture.committeeSigners,
+    validatorOrder: readonly number[] = [0, 1, 2],
+    playerFirst = true,
+  ) {
+    if (playerFirst) {
+      await fixture.pool
+        .connect(fixture.player)
+        .revealPlayerSecret(gameId, playerSecret);
+    }
+    for (const index of validatorOrder) {
+      await fixture.pool
+        .connect(committeeSigners[index])
+        .revealValidatorSecret(gameId, validatorSecrets[index]);
+    }
+    if (!playerFirst) {
+      await fixture.pool
+        .connect(fixture.player)
+        .revealPlayerSecret(gameId, playerSecret);
+    }
+  }
+
+  async function prepareAllCommits() {
+    const fixture = await deployGameFixture();
+    const playerSecret = createSecret();
+    const validatorSecrets = createValidatorSecrets();
+    const { playerCommit, validatorCommits } = await submitCommits(
+      fixture,
+      0n,
+      playerSecret,
+      validatorSecrets,
+    );
 
     return {
       ...fixture,
@@ -287,5 +346,170 @@ describe("FairJackPool commit-reveal", function () {
         .connect(prepared.player)
         .revealPlayerSecret(0n, prepared.playerSecret),
     ).to.be.revertedWithCustomError(prepared.pool, "SecretAlreadyRevealed");
+  });
+
+  it("does not generate the seed before all four reveals", async function () {
+    const prepared = await networkHelpers.loadFixture(prepareAllCommits);
+    await prepared.pool
+      .connect(prepared.player)
+      .revealPlayerSecret(0n, prepared.playerSecret);
+    await prepared.pool
+      .connect(prepared.committeeSigners[0])
+      .revealValidatorSecret(0n, prepared.validatorSecrets[0]);
+    await prepared.pool
+      .connect(prepared.committeeSigners[1])
+      .revealValidatorSecret(0n, prepared.validatorSecrets[1]);
+
+    expect(
+      (await prepared.pool.getGameRandomnessProgress(0n)).finalSeed,
+    ).to.equal(ethers.ZeroHash);
+
+    await expect(
+      prepared.pool
+        .connect(prepared.committeeSigners[2])
+        .revealValidatorSecret(0n, prepared.validatorSecrets[2]),
+    ).to.emit(prepared.pool, "FinalSeedGenerated");
+  });
+
+  it("matches the deterministic final-seed formula", async function () {
+    const prepared = await networkHelpers.loadFixture(prepareAllCommits);
+    await revealSecrets(
+      prepared,
+      0n,
+      prepared.playerSecret,
+      prepared.validatorSecrets,
+    );
+
+    const expectedSeed = createFinalSeed(
+      0n,
+      prepared.playerSecret,
+      prepared.validatorSecrets,
+      await prepared.pool.getAddress(),
+    );
+    expect(
+      (await prepared.pool.getGameRandomnessProgress(0n)).finalSeed,
+    ).to.equal(expectedSeed);
+  });
+
+  it("cannot reuse a reveal commitment in another game", async function () {
+    const fixture = await networkHelpers.loadFixture(deployGameFixture);
+    await fixture.pool.connect(fixture.player).startPoolGame(BET);
+    const secondCommittee = await fixture.pool.getGameValidators(1n);
+    const secondCommitteeSigners = secondCommittee.map((address) => {
+      const signer = fixture.signersByAddress.get(address.toLowerCase());
+      if (signer === undefined) {
+        throw new Error(`Missing signer for committee member ${address}`);
+      }
+      return signer;
+    });
+    const playerSecret = createSecret();
+    const commitForGameZero = createCommit(
+      playerSecret,
+      0n,
+      fixture.player.address,
+      await fixture.pool.getAddress(),
+    );
+    await fixture.pool
+      .connect(fixture.player)
+      .submitPlayerCommit(1n, commitForGameZero);
+
+    const validatorSecrets = createValidatorSecrets();
+    for (let index = 0; index < secondCommitteeSigners.length; ++index) {
+      const validator = secondCommitteeSigners[index];
+      await fixture.pool
+        .connect(validator)
+        .submitValidatorCommit(
+          1n,
+          createCommit(
+            validatorSecrets[index],
+            1n,
+            validator.address,
+            await fixture.pool.getAddress(),
+          ),
+        );
+    }
+
+    await expect(
+      fixture.pool
+        .connect(fixture.player)
+        .revealPlayerSecret(1n, playerSecret),
+    ).to.be.revertedWithCustomError(
+      fixture.pool,
+      "SecretDoesNotMatchCommit",
+    );
+  });
+
+  it("produces the same seed from the same inputs", async function () {
+    const fixture = await networkHelpers.loadFixture(deployGameFixture);
+    const playerSecret = createSecret();
+    const validatorSecrets = createValidatorSecrets();
+    const snapshot = await networkHelpers.takeSnapshot();
+
+    await submitCommits(fixture, 0n, playerSecret, validatorSecrets);
+    await revealSecrets(fixture, 0n, playerSecret, validatorSecrets);
+    const firstSeed = (await fixture.pool.getGameRandomnessProgress(0n))
+      .finalSeed;
+
+    await snapshot.restore();
+    await submitCommits(fixture, 0n, playerSecret, validatorSecrets);
+    await revealSecrets(fixture, 0n, playerSecret, validatorSecrets);
+    const secondSeed = (await fixture.pool.getGameRandomnessProgress(0n))
+      .finalSeed;
+
+    expect(secondSeed).to.equal(firstSeed);
+  });
+
+  it("changes the seed when one secret changes", async function () {
+    const fixture = await networkHelpers.loadFixture(deployGameFixture);
+    const playerSecret = createSecret();
+    const originalSecrets = createValidatorSecrets();
+    const snapshot = await networkHelpers.takeSnapshot();
+
+    await submitCommits(fixture, 0n, playerSecret, originalSecrets);
+    await revealSecrets(fixture, 0n, playerSecret, originalSecrets);
+    const originalSeed = (await fixture.pool.getGameRandomnessProgress(0n))
+      .finalSeed;
+
+    await snapshot.restore();
+    const modifiedSecrets: [string, string, string] = [
+      createSecret(),
+      originalSecrets[1],
+      originalSecrets[2],
+    ];
+    await submitCommits(fixture, 0n, playerSecret, modifiedSecrets);
+    await revealSecrets(fixture, 0n, playerSecret, modifiedSecrets);
+    const modifiedSeed = (await fixture.pool.getGameRandomnessProgress(0n))
+      .finalSeed;
+
+    expect(modifiedSeed).not.to.equal(originalSeed);
+  });
+
+  it("keeps the seed identical when reveal transaction order changes", async function () {
+    const prepared = await networkHelpers.loadFixture(prepareAllCommits);
+    const snapshot = await networkHelpers.takeSnapshot();
+
+    await revealSecrets(
+      prepared,
+      0n,
+      prepared.playerSecret,
+      prepared.validatorSecrets,
+    );
+    const firstSeed = (await prepared.pool.getGameRandomnessProgress(0n))
+      .finalSeed;
+
+    await snapshot.restore();
+    await revealSecrets(
+      prepared,
+      0n,
+      prepared.playerSecret,
+      prepared.validatorSecrets,
+      prepared.committeeSigners,
+      [2, 0, 1],
+      false,
+    );
+    const reorderedSeed = (await prepared.pool.getGameRandomnessProgress(0n))
+      .finalSeed;
+
+    expect(reorderedSeed).to.equal(firstSeed);
   });
 });

@@ -29,3 +29,24 @@ export function createCommit(
     ),
   );
 }
+
+export function createFinalSeed(
+  gameId: BigNumberish,
+  playerSecret: string,
+  validatorSecrets: readonly [string, string, string],
+  contractAddress: string,
+): string {
+  return keccak256(
+    AbiCoder.defaultAbiCoder().encode(
+      ["uint256", "bytes32", "bytes32", "bytes32", "bytes32", "address"],
+      [
+        gameId,
+        playerSecret,
+        validatorSecrets[0],
+        validatorSecrets[1],
+        validatorSecrets[2],
+        getAddress(contractAddress),
+      ],
+    ),
+  );
+}
