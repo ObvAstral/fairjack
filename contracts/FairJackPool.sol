@@ -32,6 +32,14 @@ contract FairJackPool is ReentrancyGuard {
     error BetAboveMaximum(uint256 maximum, uint256 provided);
     error InsufficientTokenAllowance(uint256 available, uint256 required);
     error GameDoesNotExist(uint256 gameId);
+    error InvalidGameState(GameState expected, GameState actual);
+    error GameDeadlinePassed(uint256 deadline, uint256 currentTimestamp);
+    error NotGamePlayer(address caller);
+    error NotSelectedValidator(address caller);
+    error InvalidCommitment();
+    error CommitAlreadySubmitted(address participant);
+    error SecretAlreadyRevealed(address participant);
+    error SecretDoesNotMatchCommit(address participant);
 
     event PoolDeposit(address indexed user, uint256 amount, uint256 sharesMinted);
     event PoolWithdraw(address indexed user, uint256 amount, uint256 sharesBurned);
@@ -51,6 +59,17 @@ contract FairJackPool is ReentrancyGuard {
         address validator1,
         address validator2
     );
+    event CommitSubmitted(
+        uint256 indexed gameId,
+        address indexed participant,
+        bool indexed isPlayer,
+        bytes32 commitment
+    );
+    event SecretRevealed(
+        uint256 indexed gameId,
+        address indexed participant,
+        bool indexed isPlayer
+    );
 
     IERC20 public token;
 
@@ -61,6 +80,7 @@ contract FairJackPool is ReentrancyGuard {
     uint256 public constant MIN_BET = 1 ether;
     uint256 public constant MAX_BET = 100 ether;
     uint256 public constant COMMIT_DURATION = 15 minutes;
+    uint256 public constant REVEAL_DURATION = 15 minutes;
 
     uint256 public poolBalance;
     uint256 public lockedLiquidity;
@@ -257,6 +277,89 @@ contract FairJackPool is ReentrancyGuard {
         );
     }
 
+    function submitPlayerCommit(uint256 gameId, bytes32 commitment) external {
+        Game storage game = _getGame(gameId);
+        _requireState(game, GameState.WaitingForCommits);
+        _requireBeforeDeadline(game.commitDeadline);
+        if (msg.sender != game.player) revert NotGamePlayer(msg.sender);
+        if (game.playerCommitted) revert CommitAlreadySubmitted(msg.sender);
+        if (commitment == bytes32(0)) revert InvalidCommitment();
+
+        game.playerCommit = commitment;
+        game.playerCommitted = true;
+        ++game.commitCount;
+
+        emit CommitSubmitted(gameId, msg.sender, true, commitment);
+        _beginRevealPhaseIfReady(game);
+    }
+
+    function submitValidatorCommit(uint256 gameId, bytes32 commitment) external {
+        Game storage game = _getGame(gameId);
+        _requireState(game, GameState.WaitingForCommits);
+        _requireBeforeDeadline(game.commitDeadline);
+        (bool selected, uint256 validatorIndex) = _findValidator(game, msg.sender);
+        if (!selected) revert NotSelectedValidator(msg.sender);
+        if (game.validatorCommitted[validatorIndex]) {
+            revert CommitAlreadySubmitted(msg.sender);
+        }
+        if (commitment == bytes32(0)) revert InvalidCommitment();
+
+        game.validatorCommits[validatorIndex] = commitment;
+        game.validatorCommitted[validatorIndex] = true;
+        ++game.commitCount;
+
+        emit CommitSubmitted(gameId, msg.sender, false, commitment);
+        _beginRevealPhaseIfReady(game);
+    }
+
+    function revealPlayerSecret(uint256 gameId, bytes32 secret) external {
+        Game storage game = _getGame(gameId);
+        _requireState(game, GameState.WaitingForReveals);
+        _requireBeforeDeadline(game.revealDeadline);
+        if (msg.sender != game.player) revert NotGamePlayer(msg.sender);
+        if (game.playerRevealed) revert SecretAlreadyRevealed(msg.sender);
+        if (_commitmentFor(secret, gameId, msg.sender) != game.playerCommit) {
+            revert SecretDoesNotMatchCommit(msg.sender);
+        }
+
+        game.playerSecret = secret;
+        game.playerRevealed = true;
+        ++game.revealCount;
+
+        emit SecretRevealed(gameId, msg.sender, true);
+    }
+
+    function revealValidatorSecret(uint256 gameId, bytes32 secret) external {
+        Game storage game = _getGame(gameId);
+        _requireState(game, GameState.WaitingForReveals);
+        _requireBeforeDeadline(game.revealDeadline);
+        (bool selected, uint256 validatorIndex) = _findValidator(game, msg.sender);
+        if (!selected) revert NotSelectedValidator(msg.sender);
+        if (game.validatorRevealed[validatorIndex]) {
+            revert SecretAlreadyRevealed(msg.sender);
+        }
+        if (
+            _commitmentFor(secret, gameId, msg.sender)
+                != game.validatorCommits[validatorIndex]
+        ) {
+            revert SecretDoesNotMatchCommit(msg.sender);
+        }
+
+        game.validatorSecrets[validatorIndex] = secret;
+        game.validatorRevealed[validatorIndex] = true;
+        ++game.revealCount;
+
+        emit SecretRevealed(gameId, msg.sender, false);
+    }
+
+    function computeCommitment(
+        bytes32 secret,
+        uint256 gameId,
+        address participant
+    ) external view returns (bytes32) {
+        return _commitmentFor(secret, gameId, participant);
+    }
+
     function getGameCore(uint256 gameId)
         external
         view
@@ -293,6 +396,48 @@ contract FairJackPool is ReentrancyGuard {
             game.commitDeadline,
             game.revealDeadline,
             game.actionDeadline
+        );
+    }
+
+    function getGameRandomnessProgress(uint256 gameId)
+        external
+        view
+        returns (
+            bytes32 playerCommit,
+            bool playerCommitted,
+            bool playerRevealed,
+            uint8 commitCount,
+            uint8 revealCount,
+            bytes32 finalSeed
+        )
+    {
+        Game storage game = _getGame(gameId);
+        return (
+            game.playerCommit,
+            game.playerCommitted,
+            game.playerRevealed,
+            game.commitCount,
+            game.revealCount,
+            game.finalSeed
+        );
+    }
+
+    function getValidatorRandomnessStatus(uint256 gameId, address validator)
+        external
+        view
+        returns (
+            bytes32 commitment,
+            bool committed,
+            bool revealed
+        )
+    {
+        Game storage game = _getGame(gameId);
+        (bool selected, uint256 validatorIndex) = _findValidator(game, validator);
+        if (!selected) revert NotSelectedValidator(validator);
+        return (
+            game.validatorCommits[validatorIndex],
+            game.validatorCommitted[validatorIndex],
+            game.validatorRevealed[validatorIndex]
         );
     }
 
@@ -411,6 +556,47 @@ contract FairJackPool is ReentrancyGuard {
         }
 
         ++info.activeGames;
+    }
+
+    function _beginRevealPhaseIfReady(Game storage game) private {
+        if (game.commitCount == COMMITTEE_SIZE + 1) {
+            game.state = GameState.WaitingForReveals;
+            game.revealDeadline = block.timestamp + REVEAL_DURATION;
+        }
+    }
+
+    function _commitmentFor(
+        bytes32 secret,
+        uint256 gameId,
+        address participant
+    ) private view returns (bytes32) {
+        return keccak256(
+            abi.encode(secret, gameId, participant, address(this))
+        );
+    }
+
+    function _findValidator(Game storage game, address participant)
+        private
+        view
+        returns (bool selected, uint256 validatorIndex)
+    {
+        for (uint256 index; index < COMMITTEE_SIZE; ++index) {
+            if (game.selectedValidators[index] == participant) {
+                return (true, index);
+            }
+        }
+    }
+
+    function _requireState(Game storage game, GameState expected) private view {
+        if (game.state != expected) {
+            revert InvalidGameState(expected, game.state);
+        }
+    }
+
+    function _requireBeforeDeadline(uint256 deadline) private view {
+        if (block.timestamp > deadline) {
+            revert GameDeadlinePassed(deadline, block.timestamp);
+        }
     }
 
     function _requiredValidatorCollateral(uint256 activeGames)
