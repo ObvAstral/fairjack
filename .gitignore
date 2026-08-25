@@ -1,20 +1,26 @@
-node_modules/
-frontend/node_modules/
+/node_modules/
+/frontend/node_modules/
 
 .env
 .env.*
 !.env.example
 
-artifacts/
-cache/
-coverage/
-types/
+/artifacts/
+/cache/
+/coverage/
+/types/
 
-dist/
-frontend/dist/
+/dist/
+/frontend/dist/
+/.vite/
+
+*.log
+npm-debug.log*
 
 .DS_Store
 
 # Local project workspace
-*.md
-.project-local/
+/FAIRJACK_IMPLEMENTATION_PLAN.md
+/.project-local/
+/.agents/
+/.codex/
