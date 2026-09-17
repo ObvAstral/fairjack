@@ -34,6 +34,8 @@ contract FairJackPool is ReentrancyGuard {
     error GameDoesNotExist(uint256 gameId);
     error InvalidGameState(GameState expected, GameState actual);
     error GameDeadlinePassed(uint256 deadline, uint256 currentTimestamp);
+    error GameDeadlineNotReached(uint256 deadline, uint256 currentTimestamp);
+    error TimeoutUnavailable(GameState state);
     error NotGamePlayer(address caller);
     error NotSelectedValidator(address caller);
     error InvalidCommitment();
@@ -105,6 +107,11 @@ contract FairJackPool is ReentrancyGuard {
         address indexed validator,
         uint256 amount
     );
+    event PlayerPenalized(
+        uint256 indexed gameId,
+        address indexed player,
+        uint256 amount
+    );
     event GameCancelled(uint256 indexed gameId);
     event TimeoutClaimed(
         uint256 indexed gameId,
@@ -117,6 +124,8 @@ contract FairJackPool is ReentrancyGuard {
     uint256 public constant COMMITTEE_SIZE = 3;
     uint256 public constant MIN_VALIDATOR_COLLATERAL = 100 ether;
     uint256 public constant VALIDATOR_COLLATERAL_PER_GAME = 100 ether;
+    uint256 public constant VALIDATOR_SLASH_AMOUNT =
+        VALIDATOR_COLLATERAL_PER_GAME;
     uint256 public constant MAX_VALIDATOR_ACTIVE_GAMES = 10;
     uint256 public constant MIN_BET = 1 ether;
     uint256 public constant MAX_BET = 100 ether;
@@ -456,6 +465,69 @@ contract FairJackPool is ReentrancyGuard {
 
         game.state = GameState.DealerTurn;
         _resolveDealer(gameId, game, playerScore);
+    }
+
+    /// @notice Resolves a game whose current participant deadline has expired.
+    /// @dev Anyone may call this function so an abandoned game cannot keep pool
+    ///      liquidity or validator collateral reserved indefinitely.
+    function claimTimeout(uint256 gameId) external nonReentrant {
+        Game storage game = _getGame(gameId);
+        GameState timedOutState = game.state;
+        uint256 deadline;
+
+        if (timedOutState == GameState.WaitingForCommits) {
+            deadline = game.commitDeadline;
+        } else if (timedOutState == GameState.WaitingForReveals) {
+            deadline = game.revealDeadline;
+        } else if (timedOutState == GameState.PlayerTurn) {
+            deadline = game.actionDeadline;
+        } else {
+            revert TimeoutUnavailable(timedOutState);
+        }
+
+        if (block.timestamp <= deadline) {
+            revert GameDeadlineNotReached(deadline, block.timestamp);
+        }
+
+        emit TimeoutClaimed(gameId, msg.sender, timedOutState);
+
+        if (timedOutState == GameState.PlayerTurn) {
+            uint8[] memory playerHand = game.playerCards;
+            uint8[] memory dealerHand = game.dealerCards;
+            uint256 playerScore = _calculateHandScore(playerHand);
+            uint256 dealerScore = _calculateHandScore(dealerHand);
+
+            emit PlayerPenalized(gameId, game.player, game.bet);
+            _settleGame(
+                gameId,
+                game,
+                GameResult.DealerWin,
+                playerScore,
+                dealerScore
+            );
+            return;
+        }
+
+        bool playerDefaulted = timedOutState == GameState.WaitingForCommits
+            ? !game.playerCommitted
+            : !game.playerRevealed;
+
+        for (uint256 index; index < COMMITTEE_SIZE; ++index) {
+            bool validatorDefaulted = timedOutState
+                == GameState.WaitingForCommits
+                ? !game.validatorCommitted[index]
+                : !game.validatorRevealed[index];
+
+            if (validatorDefaulted) {
+                _slashValidator(
+                    gameId,
+                    game.selectedValidators[index],
+                    VALIDATOR_SLASH_AMOUNT
+                );
+            }
+        }
+
+        _cancelTimedOutGame(gameId, game, playerDefaulted);
     }
 
     function getGameCore(uint256 gameId)
@@ -885,6 +957,51 @@ contract FairJackPool is ReentrancyGuard {
             playerScore,
             dealerScore
         );
+    }
+
+    function _cancelTimedOutGame(
+        uint256 gameId,
+        Game storage game,
+        bool playerDefaulted
+    ) private {
+        game.state = GameState.Cancelled;
+        lockedLiquidity -= game.maxPayout;
+
+        for (uint256 index; index < COMMITTEE_SIZE; ++index) {
+            --validators[game.selectedValidators[index]].activeGames;
+        }
+
+        uint256 refund;
+        if (playerDefaulted) {
+            poolBalance += game.bet;
+            emit PlayerPenalized(gameId, game.player, game.bet);
+        } else {
+            refund = game.bet;
+            game.payout = refund;
+        }
+
+        if (refund != 0) {
+            token.safeTransfer(game.player, refund);
+        }
+
+        emit GameCancelled(gameId);
+    }
+
+    function _slashValidator(
+        uint256 gameId,
+        address validator,
+        uint256 amount
+    ) private {
+        ValidatorInfo storage info = validators[validator];
+        uint256 slashAmount = amount < info.collateral
+            ? amount
+            : info.collateral;
+
+        info.collateral -= slashAmount;
+        ++info.slashCount;
+        poolBalance += slashAmount;
+
+        emit ValidatorSlashed(gameId, validator, slashAmount);
     }
 
     function _findValidator(Game storage game, address participant)
