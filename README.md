@@ -91,6 +91,32 @@ Importa almeno quattro account usando le chiavi private stampate da `npm run nod
 
 Per ripartire da zero interrompi il nodo, riavvialo e ripeti deploy e frontend. Se MetaMask conserva nonce/stato della chain precedente, usa “Cancella attività e dati delle schede” nelle impostazioni avanzate del wallet oppure rimuovi e riaggiungi la rete locale.
 
+## Deploy su Sepolia
+
+Il deploy Sepolia usa due configurazioni distinte:
+
+- `SEPOLIA_RPC_URL` e `SEPOLIA_PRIVATE_KEY` restano lato Hardhat e non devono essere pubblicate;
+- `SEPOLIA_PUBLIC_RPC_URL` viene scritto nel bundle del frontend e deve quindi essere un endpoint browser-safe, senza credenziali riservate.
+
+Salva RPC privato e chiave del deployer nel keystore cifrato di Hardhat:
+
+```bash
+npx hardhat keystore set SEPOLIA_RPC_URL
+npx hardhat keystore set SEPOLIA_PRIVATE_KEY
+```
+
+Il deployer deve avere Sepolia ETH. Configura poi l'RPC pubblico per la sola sessione corrente ed esegui il deploy:
+
+```bash
+export SEPOLIA_PUBLIC_RPC_URL="https://endpoint-sepolia-browser-safe"
+npm run deploy:sepolia
+npm run frontend
+```
+
+Lo script verifica il chain ID `11155111`, distribuisce `MockERC20` e `FairJackPool` e genera `frontend/.env.local` con indirizzi e metadati della rete. Il file è ignorato da Git.
+
+Per collaudare una partita servono almeno quattro account con Sepolia ETH: un player e tre validator distinti. Il token FJT è liberamente mintabile perché è un token didattico. Su Sepolia il tempo non può essere avanzato artificialmente: i test di timeout richiedono di attendere realmente le deadline on-chain di 5 o 15 minuti.
+
 ## Comandi principali
 
 Compilazione contratti:

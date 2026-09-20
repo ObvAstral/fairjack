@@ -71,7 +71,7 @@ export default function TokenPanel({
 
   return (
     <section>
-      <div className="section-heading"><div><span className="step">01</span><h2>Test token</h2></div><p>Crea fondi locali e autorizza il pool.</p></div>
+      <div className="section-heading"><div><span className="step">01</span><h2>Test token</h2></div><p>Crea token FJT e autorizza il pool.</p></div>
       <dl className="stats">
         <div><dt>Saldo {symbol}</dt><dd>{balance}</dd></div>
         <div><dt>Allowance pool</dt><dd>{allowance} {symbol}</dd></div>

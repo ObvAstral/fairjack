@@ -5,6 +5,10 @@ type ContractConfig = {
   poolAddress: string | null;
   expectedChainId: bigint;
   rpcUrl: string;
+  networkName: string;
+  nativeCurrencyName: string;
+  nativeCurrencySymbol: string;
+  blockExplorerUrl: string | null;
   errors: string[];
 };
 
@@ -33,10 +37,28 @@ function readChainId() {
   }
 }
 
+const expectedChainId = readChainId();
+const isLocal = expectedChainId === 31337n;
+const isSepolia = expectedChainId === 11155111n;
+
+function readRpcUrl() {
+  const value = import.meta.env.VITE_RPC_URL?.trim()
+    || (isLocal ? "http://127.0.0.1:8545" : "");
+  if (!value) errors.push("VITE_RPC_URL non configurato");
+  return value;
+}
+
 export const contractConfig: ContractConfig = {
   tokenAddress: readAddress("VITE_TOKEN_ADDRESS", errors),
   poolAddress: readAddress("VITE_POOL_ADDRESS", errors),
-  expectedChainId: readChainId(),
-  rpcUrl: import.meta.env.VITE_RPC_URL?.trim() || "http://127.0.0.1:8545",
+  expectedChainId,
+  rpcUrl: readRpcUrl(),
+  networkName: import.meta.env.VITE_NETWORK_NAME?.trim()
+    || (isSepolia ? "Sepolia" : isLocal ? "Hardhat Local" : `Chain ${expectedChainId.toString()}`),
+  nativeCurrencyName: import.meta.env.VITE_NATIVE_CURRENCY_NAME?.trim()
+    || (isSepolia ? "Sepolia Ether" : "Ether"),
+  nativeCurrencySymbol: import.meta.env.VITE_NATIVE_CURRENCY_SYMBOL?.trim() || "ETH",
+  blockExplorerUrl: import.meta.env.VITE_BLOCK_EXPLORER_URL?.trim()
+    || (isSepolia ? "https://sepolia.etherscan.io" : null),
   errors,
 };

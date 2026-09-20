@@ -64,9 +64,16 @@ export default function App() {
           method: "wallet_addEthereumChain",
           params: [{
             chainId,
-            chainName: "Hardhat Local",
-            nativeCurrency: { name: "Local ETH", symbol: "ETH", decimals: 18 },
+            chainName: contractConfig.networkName,
+            nativeCurrency: {
+              name: contractConfig.nativeCurrencyName,
+              symbol: contractConfig.nativeCurrencySymbol,
+              decimals: 18,
+            },
             rpcUrls: [contractConfig.rpcUrl],
+            ...(contractConfig.blockExplorerUrl
+              ? { blockExplorerUrls: [contractConfig.blockExplorerUrl] }
+              : {}),
           }],
         });
       } catch (addCause) {
@@ -101,7 +108,7 @@ export default function App() {
     ]).then(([tokenCode, poolCode]) => {
       if (!active) return;
       setDeploymentError(tokenCode === "0x" || poolCode === "0x"
-        ? "Gli indirizzi configurati non contengono contratti su questa chain. Riavvia il deploy locale e il frontend."
+        ? "Gli indirizzi configurati non contengono contratti su questa chain. Verifica il deploy e la configurazione del frontend."
         : null);
     }).catch((cause: unknown) => {
       if (active) setDeploymentError(readableError(cause));
@@ -116,6 +123,7 @@ export default function App() {
   };
 
   const correctNetwork = wallet.chainId === contractConfig.expectedChainId;
+  const localNetwork = contractConfig.expectedChainId === 31337n;
   const appReady = Boolean(wallet.account && correctNetwork && contractConfig.errors.length === 0 && !deploymentError);
 
   return (
@@ -123,7 +131,7 @@ export default function App() {
       <header className="hero">
         <div>
           <span className="brand-mark">FJ</span>
-          <div><h1>FairJack</h1><p>Blackjack decentralizzato · console locale</p></div>
+          <div><h1>FairJack</h1><p>Blackjack decentralizzato · {contractConfig.networkName}</p></div>
         </div>
         <span className="build-label">TESTNET UI</span>
       </header>
@@ -143,13 +151,14 @@ export default function App() {
         connecting={connecting}
         error={walletError}
         expectedChainId={contractConfig.expectedChainId}
+        networkName={contractConfig.networkName}
         onConnect={() => void connect()}
         onClear={() => setWallet({ provider: null, signer: null, account: null, chainId: null })}
         onSwitchNetwork={() => void switchNetwork()}
       />
 
-      {!wallet.account && <div className="empty-state"><strong>Connetti il wallet per iniziare.</strong><span>Usa gli account del nodo Hardhat locale per simulare player, staker e validator.</span></div>}
-      {wallet.account && !correctNetwork && <div className="empty-state"><strong>Rete non corretta.</strong><span>Passa alla chain {contractConfig.expectedChainId.toString()} per usare i contratti configurati.</span></div>}
+      {!wallet.account && <div className="empty-state"><strong>Connetti il wallet per iniziare.</strong><span>Gli account che inviano transazioni devono avere ETH sulla rete {contractConfig.networkName}.</span></div>}
+      {wallet.account && !correctNetwork && <div className="empty-state"><strong>Rete non corretta.</strong><span>Passa a {contractConfig.networkName} (chain {contractConfig.expectedChainId.toString()}) per usare i contratti configurati.</span></div>}
 
       {appReady && (
         <>
@@ -178,7 +187,7 @@ export default function App() {
               <li>Da un quarto account crea la partita e invia il commit del player.</li>
               <li>Passa ai tre validator selezionati: genera il segreto e invia ogni commit.</li>
               <li>Esegui i quattro reveal, poi usa Hit o Stand dal player.</li>
-              <li>Per slashing e penalità, crea nuove partite, ometti un’azione e usa “Supera deadline”.</li>
+              <li>Per slashing e penalità, crea nuove partite, ometti un’azione e {localNetwork ? "usa “Supera deadline”." : "attendi la deadline on-chain prima del claim."}</li>
             </ol>
           </details>
         </>

@@ -4,6 +4,7 @@ type ConnectWalletProps = {
   connecting: boolean;
   error: string | null;
   expectedChainId: bigint;
+  networkName: string;
   onConnect: () => void;
   onClear: () => void;
   onSwitchNetwork: () => void;
@@ -15,6 +16,7 @@ export default function ConnectWallet({
   connecting,
   error,
   expectedChainId,
+  networkName,
   onConnect,
   onClear,
   onSwitchNetwork,
@@ -30,10 +32,10 @@ export default function ConnectWallet({
       {account ? (
         <div className="wallet-actions">
           <span className={`network-pill ${wrongNetwork ? "wrong" : ""}`}>
-            <i /> Chain {chainId?.toString() ?? "—"}
+            <i /> {wrongNetwork ? `Chain ${chainId?.toString() ?? "—"}` : networkName}
           </span>
           {wrongNetwork && (
-            <button type="button" onClick={onSwitchNetwork}>Passa a {expectedChainId.toString()}</button>
+            <button type="button" onClick={onSwitchNetwork}>Passa a {networkName}</button>
           )}
           <button type="button" className="secondary" onClick={onClear}>Scollega dalla UI</button>
         </div>
