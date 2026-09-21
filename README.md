@@ -4,7 +4,7 @@ FairJack è un prototipo di blackjack decentralizzato su Ethereum.
 
 ## FairJack v1
 
-La versione consegnabile include:
+La versione include:
 
 - blackjack semplificato;
 - ERC20 token di test;
@@ -92,6 +92,46 @@ Importa almeno quattro account usando le chiavi private stampate da `npm run nod
 Per ripartire da zero interrompi il nodo, riavvialo e ripeti deploy e frontend. Se MetaMask conserva nonce/stato della chain precedente, usa “Cancella attività e dati delle schede” nelle impostazioni avanzate del wallet oppure rimuovi e riaggiungi la rete locale.
 
 ## Deploy su Sepolia
+
+### Deploy ufficiale
+
+La versione corrente è distribuita su **Ethereum Sepolia** (chain ID `11155111`):
+
+| Contratto | Indirizzo |
+| --- | --- |
+| MockERC20 | [`0x8D95D8fB19f295fD08Bb10264C9cafe5bB7d9EC0`](https://sepolia.etherscan.io/address/0x8D95D8fB19f295fD08Bb10264C9cafe5bB7d9EC0) |
+| FairJackPool | [`0x083d6c4402A5D9fAdfD6Bc99d0f6c4DE265aa6D0`](https://sepolia.etherscan.io/address/0x083d6c4402A5D9fAdfD6Bc99d0f6c4DE265aa6D0) |
+
+Per usare il deploy ufficiale senza distribuire nuovi contratti, copia la configurazione di esempio:
+
+```bash
+cp frontend/.env.example frontend/.env.local
+```
+
+Configura `frontend/.env.local` in questo modo:
+
+```dotenv
+VITE_TOKEN_ADDRESS=0x8D95D8fB19f295fD08Bb10264C9cafe5bB7d9EC0
+VITE_POOL_ADDRESS=0x083d6c4402A5D9fAdfD6Bc99d0f6c4DE265aa6D0
+VITE_CHAIN_ID=11155111
+VITE_RPC_URL=https://ethereum-sepolia-rpc.publicnode.com
+VITE_NETWORK_NAME=Sepolia
+VITE_NATIVE_CURRENCY_NAME=Sepolia Ether
+VITE_NATIVE_CURRENCY_SYMBOL=ETH
+VITE_BLOCK_EXPLORER_URL=https://sepolia.etherscan.io
+```
+
+Installa le dipendenze e avvia il frontend dalla root del progetto:
+
+```bash
+npm install
+npm --prefix frontend install
+npm run frontend
+```
+
+Apri l'indirizzo mostrato da Vite, normalmente `http://localhost:5173`, connetti il wallet e seleziona Sepolia. Gli account che inviano transazioni devono avere Sepolia ETH per il gas.
+
+### Nuovo deploy
 
 Il deploy Sepolia usa due configurazioni distinte:
 
