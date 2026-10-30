@@ -5,29 +5,33 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/math/Math.sol";
+import {VRFV2PlusWrapperConsumerBase} from "@chainlink/contracts/src/v0.8/vrf/dev/VRFV2PlusWrapperConsumerBase.sol";
+import {VRFV2PlusClient} from "@chainlink/contracts/src/v0.8/vrf/dev/libraries/VRFV2PlusClient.sol";
 
-/// @notice House pool for FairJack games using a conventional ERC-20 wager token.
-/// @dev Fee-on-transfer and rebasing tokens are not supported because the pool
-///      accounting assumes that transferred amounts match the requested amounts.
-contract FairJackPool is ReentrancyGuard {
+/// @notice ERC-20 blackjack bankroll with pool-funded Chainlink VRF v2.5.
+/// @dev Native ETH donations finance the oracle; they do not mint token shares
+///      and are not redeemable. Fee-on-transfer/rebasing wager tokens are unsupported.
+///      No owner, subscription manager, cancellation, or randomness re-roll exists.
+contract FairJackPool is ReentrancyGuard, VRFV2PlusWrapperConsumerBase {
     using SafeERC20 for IERC20;
 
     error InvalidTokenAddress();
+    error InvalidOracleAddress();
+    error InvalidOracleFeeLimit();
     error ZeroAmount();
     error ZeroShares();
     error ZeroSharesMinted();
     error ZeroWithdrawalAmount();
     error InsolventPool();
+    error ActiveGamesPreventShareChanges();
     error InsufficientShares(uint256 available, uint256 requested);
     error InsufficientAvailableLiquidity(uint256 available, uint256 requested);
     error UnsupportedTokenTransfer(uint256 expected, uint256 received);
-    error AlreadyRegisteredValidator();
-    error NotRegisteredValidator();
-    error InsufficientValidatorCollateral(uint256 minimum, uint256 provided);
-    error ValidatorHasActiveGames(uint256 activeGames);
-    error InsufficientWithdrawableCollateral(uint256 available, uint256 requested);
-    error InsufficientEligibleValidators(uint256 required, uint256 available);
-    error ValidatorCapacityReached(address validator);
+    error InsufficientOracleReserve(uint256 available, uint256 required);
+    error OracleUnavailable();
+    error NoQueuedRandomness();
+    error OracleRequestLimitReached();
+    error InvalidOracleRequest();
     error BetBelowMinimum(uint256 minimum, uint256 provided);
     error BetAboveMaximum(uint256 maximum, uint256 provided);
     error InsufficientTokenAllowance(uint256 available, uint256 required);
@@ -37,46 +41,36 @@ contract FairJackPool is ReentrancyGuard {
     error GameDeadlineNotReached(uint256 deadline, uint256 currentTimestamp);
     error TimeoutUnavailable(GameState state);
     error NotGamePlayer(address caller);
-    error NotSelectedValidator(address caller);
-    error InvalidCommitment();
-    error CommitAlreadySubmitted(address participant);
-    error SecretAlreadyRevealed(address participant);
-    error SecretDoesNotMatchCommit(address participant);
     error RandomnessNotReady();
     error DeckExhausted();
     error InvalidCard(uint8 card);
     error PlayerAlreadyBust();
 
-    event PoolDeposit(address indexed user, uint256 amount, uint256 sharesMinted);
-    event PoolWithdraw(address indexed user, uint256 amount, uint256 sharesBurned);
-    event ValidatorRegistered(address indexed validator, uint256 collateral);
-    event ValidatorUnregistered(address indexed validator, uint256 collateralReturned);
-    event ValidatorCollateralAdded(address indexed validator, uint256 amount);
-    event ValidatorCollateralWithdrawn(address indexed validator, uint256 amount);
+    event PoolDeposit(
+        address indexed user,
+        uint256 amount,
+        uint256 sharesMinted
+    );
+    event PoolWithdraw(
+        address indexed user,
+        uint256 amount,
+        uint256 sharesBurned
+    );
+    event OracleReserveFunded(address indexed funder, uint256 amount);
+    event RandomnessRequested(
+        uint256 indexed gameId,
+        uint256 indexed requestId,
+        RandomnessPhase phase,
+        uint256 paid
+    );
+    event OracleRequestDeferred(uint256 indexed gameId, RandomnessPhase phase);
+    event RandomnessReceived(uint256 indexed gameId, uint256 indexed requestId);
     event PoolGameStarted(
         uint256 indexed gameId,
         address indexed player,
         uint256 bet,
         uint256 maxPayout
     );
-    event ValidatorsSelected(
-        uint256 indexed gameId,
-        address validator0,
-        address validator1,
-        address validator2
-    );
-    event CommitSubmitted(
-        uint256 indexed gameId,
-        address indexed participant,
-        bool indexed isPlayer,
-        bytes32 commitment
-    );
-    event SecretRevealed(
-        uint256 indexed gameId,
-        address indexed participant,
-        bool indexed isPlayer
-    );
-    event FinalSeedGenerated(uint256 indexed gameId, bytes32 finalSeed);
     event CardDrawn(
         uint256 indexed gameId,
         bool indexed playerHand,
@@ -84,11 +78,7 @@ contract FairJackPool is ReentrancyGuard {
         uint256 handSize
     );
     event GameStarted(uint256 indexed gameId, address indexed player);
-    event PlayerHit(
-        uint256 indexed gameId,
-        uint8 card,
-        uint256 playerScore
-    );
+    event PlayerHit(uint256 indexed gameId, uint8 card, uint256 playerScore);
     event PlayerStand(uint256 indexed gameId, uint256 playerScore);
     event DealerResolved(
         uint256 indexed gameId,
@@ -102,65 +92,54 @@ contract FairJackPool is ReentrancyGuard {
         uint256 playerScore,
         uint256 dealerScore
     );
-    event ValidatorSlashed(
-        uint256 indexed gameId,
-        address indexed validator,
-        uint256 amount
-    );
     event PlayerPenalized(
         uint256 indexed gameId,
         address indexed player,
         uint256 amount
     );
-    event GameCancelled(uint256 indexed gameId);
     event TimeoutClaimed(
         uint256 indexed gameId,
         address indexed claimant,
         GameState timedOutState
     );
 
-    IERC20 public token;
-
-    uint256 public constant COMMITTEE_SIZE = 3;
-    uint256 public constant MIN_VALIDATOR_COLLATERAL = 100 ether;
-    uint256 public constant VALIDATOR_COLLATERAL_PER_GAME = 100 ether;
-    uint256 public constant VALIDATOR_SLASH_AMOUNT =
-        VALIDATOR_COLLATERAL_PER_GAME;
-    uint256 public constant MAX_VALIDATOR_ACTIVE_GAMES = 10;
+    IERC20 public immutable token;
     uint256 public constant MIN_BET = 1 ether;
     uint256 public constant MAX_BET = 100 ether;
-    uint256 public constant COMMIT_DURATION = 15 minutes;
-    uint256 public constant REVEAL_DURATION = 15 minutes;
     uint256 public constant ACTION_DURATION = 5 minutes;
+    uint32 public constant CALLBACK_GAS_LIMIT = 120_000;
+    uint16 public constant REQUEST_CONFIRMATIONS = 3;
+    // A non-bust hand has at most 11 cards: the 12 smallest cards total 24.
+    // Conservatively reserve initial deal + 10 hits + one whole dealer phase.
+    uint256 public constant MAX_RANDOMNESS_REQUESTS_PER_GAME = 12;
+    uint256 public immutable maxOracleRequestCost;
 
     uint256 public poolBalance;
     uint256 public lockedLiquidity;
     uint256 public totalShares;
-
+    uint256 public lockedOracleBudget;
+    uint256 public totalOracleFunded;
+    uint256 public totalOracleSpent;
     mapping(address => uint256) public sharesOf;
 
     enum GameState {
         Created,
-        WaitingForCommits,
-        WaitingForReveals,
+        WaitingForRandomness,
+        RandomnessReady,
         PlayerTurn,
         DealerTurn,
-        Finished,
-        Cancelled
+        Finished
     }
-
     enum GameResult {
         None,
         PlayerWin,
         DealerWin,
         Push
     }
-
-    struct ValidatorInfo {
-        bool registered;
-        uint256 collateral;
-        uint256 activeGames;
-        uint256 slashCount;
+    enum RandomnessPhase {
+        InitialDeal,
+        PlayerHit,
+        Dealer
     }
 
     struct Game {
@@ -170,367 +149,420 @@ contract FairJackPool is ReentrancyGuard {
         GameState state;
         GameResult result;
         uint256 payout;
-
-        bytes32 playerCommit;
-        bytes32 playerSecret;
-        bool playerCommitted;
-        bool playerRevealed;
-
-        address[3] selectedValidators;
-        bytes32[3] validatorCommits;
-        bytes32[3] validatorSecrets;
-        bool[3] validatorCommitted;
-        bool[3] validatorRevealed;
-        uint8 commitCount;
-        uint8 revealCount;
-
         uint8[] playerCards;
         uint8[] dealerCards;
-
-        bytes32 finalSeed;
-        uint256 cardNonce;
+        // Sparse Fisher-Yates deck. Zero means the original value at that index;
+        // stored replacements are encoded as card + 1 to represent card zero.
+        uint8[52] deck;
         bool[52] drawnCards;
-
-        uint256 commitDeadline;
-        uint256 revealDeadline;
+        uint8 cardsDrawn;
         uint256 actionDeadline;
+        uint256 pendingRequestId;
+        uint256 requestCount;
+        uint256 oracleBudgetRemaining;
+        uint256 oracleSpent;
+        RandomnessPhase queuedPhase;
+        bool requestQueued;
     }
 
-    mapping(address => ValidatorInfo) public validators;
-    address[] public validatorList;
+    struct RandomnessRequest {
+        uint256 gameId;
+        RandomnessPhase phase;
+        bool exists;
+        bool fulfilled;
+        bool consumed;
+        uint256 randomWord;
+        uint256 paid;
+    }
 
     mapping(uint256 => Game) internal games;
+    mapping(uint256 => RandomnessRequest) public randomnessRequests;
     uint256 public nextGameId;
 
-    constructor(address tokenAddress) {
+    constructor(
+        address tokenAddress,
+        address wrapperAddress,
+        uint256 feeLimit
+    ) VRFV2PlusWrapperConsumerBase(_validatedWrapper(wrapperAddress)) {
         if (tokenAddress == address(0)) revert InvalidTokenAddress();
+        if (
+            feeLimit == 0 ||
+            feeLimit > type(uint256).max / MAX_RANDOMNESS_REQUESTS_PER_GAME
+        ) {
+            revert InvalidOracleFeeLimit();
+        }
         token = IERC20(tokenAddress);
+        maxOracleRequestCost = feeLimit;
     }
 
-    /// @notice Returns the number of addresses ever added to the validator list.
-    function getValidatorCount() external view returns (uint256) {
-        return validatorList.length;
+    function _validatedWrapper(
+        address wrapperAddress
+    ) private view returns (address) {
+        if (wrapperAddress.code.length == 0) revert InvalidOracleAddress();
+        return wrapperAddress;
     }
 
-    /// @notice Opts the caller into validator selection and deposits collateral.
-    function registerAsValidator(uint256 collateral) external nonReentrant {
-        ValidatorInfo storage info = validators[msg.sender];
-        if (info.registered) revert AlreadyRegisteredValidator();
-        if (collateral < MIN_VALIDATOR_COLLATERAL) {
-            revert InsufficientValidatorCollateral(MIN_VALIDATOR_COLLATERAL, collateral);
-        }
-
-        uint256 balanceBefore = token.balanceOf(address(this));
-        token.safeTransferFrom(msg.sender, address(this), collateral);
-        uint256 received = token.balanceOf(address(this)) - balanceBefore;
-        if (received != collateral) revert UnsupportedTokenTransfer(collateral, received);
-
-        info.registered = true;
-        info.collateral = collateral;
-        validatorList.push(msg.sender);
-
-        emit ValidatorRegistered(msg.sender, collateral);
+    /// @notice Irrevocable service-budget donation; no shares or withdrawal rights.
+    function fundOracle() external payable {
+        _recordOracleFunding();
+    }
+    receive() external payable {
+        _recordOracleFunding();
     }
 
-    /// @notice Opts the caller out and returns all collateral when no game is active.
-    function unregisterAsValidator() external nonReentrant {
-        ValidatorInfo storage info = validators[msg.sender];
-        if (!info.registered) revert NotRegisteredValidator();
-        if (info.activeGames != 0) revert ValidatorHasActiveGames(info.activeGames);
-
-        uint256 collateral = info.collateral;
-        info.registered = false;
-        info.collateral = 0;
-        _removeValidator(msg.sender);
-
-        token.safeTransfer(msg.sender, collateral);
-
-        emit ValidatorUnregistered(msg.sender, collateral);
+    function _recordOracleFunding() private {
+        if (msg.value == 0) revert ZeroAmount();
+        totalOracleFunded += msg.value;
+        emit OracleReserveFunded(msg.sender, msg.value);
     }
 
-    /// @notice Adds collateral to an already registered validator.
-    function addValidatorCollateral(uint256 amount) external nonReentrant {
-        if (amount == 0) revert ZeroAmount();
-
-        ValidatorInfo storage info = validators[msg.sender];
-        if (!info.registered) revert NotRegisteredValidator();
-
-        uint256 balanceBefore = token.balanceOf(address(this));
-        token.safeTransferFrom(msg.sender, address(this), amount);
-        uint256 received = token.balanceOf(address(this)) - balanceBefore;
-        if (received != amount) revert UnsupportedTokenTransfer(amount, received);
-
-        info.collateral += amount;
-
-        emit ValidatorCollateralAdded(msg.sender, amount);
+    function vrfWrapper() external view returns (address) {
+        return address(i_vrfV2PlusWrapper);
+    }
+    function getOracleReserve() external view returns (uint256) {
+        return address(this).balance;
+    }
+    function getAvailableOracleReserve() public view returns (uint256) {
+        return address(this).balance - lockedOracleBudget;
+    }
+    function getRequiredOracleBudget() public view returns (uint256) {
+        return maxOracleRequestCost * MAX_RANDOMNESS_REQUESTS_PER_GAME;
+    }
+    function quoteOracleRequest() public view returns (uint256) {
+        return
+            i_vrfV2PlusWrapper.calculateRequestPriceNative(
+                CALLBACK_GAS_LIMIT,
+                1
+            );
     }
 
-    /// @notice Withdraws collateral not required for registration or active games.
-    function withdrawValidatorCollateral(uint256 amount) external nonReentrant {
-        if (amount == 0) revert ZeroAmount();
-
-        ValidatorInfo storage info = validators[msg.sender];
-        if (!info.registered) revert NotRegisteredValidator();
-
-        uint256 requiredCollateral = _requiredValidatorCollateral(info.activeGames);
-        uint256 available = info.collateral > requiredCollateral
-            ? info.collateral - requiredCollateral
-            : 0;
-        if (amount > available) {
-            revert InsufficientWithdrawableCollateral(available, amount);
-        }
-
-        info.collateral -= amount;
-        token.safeTransfer(msg.sender, amount);
-
-        emit ValidatorCollateralWithdrawn(msg.sender, amount);
-    }
-
-    /// @notice Creates a pool-backed game before the player submits a commit.
-    function startPoolGame(uint256 bet)
-        external
-        nonReentrant
-        returns (uint256 gameId)
-    {
+    function startPoolGame(
+        uint256 bet
+    ) external nonReentrant returns (uint256 gameId) {
         if (bet < MIN_BET) revert BetBelowMinimum(MIN_BET, bet);
         if (bet > MAX_BET) revert BetAboveMaximum(MAX_BET, bet);
-
         uint256 allowance = token.allowance(msg.sender, address(this));
         if (allowance < bet) revert InsufficientTokenAllowance(allowance, bet);
+        uint256 maxPayout = bet * 2;
+        uint256 available = getAvailableLiquidity();
+        if (available < maxPayout)
+            revert InsufficientAvailableLiquidity(available, maxPayout);
+        uint256 budget = getRequiredOracleBudget();
+        uint256 oracleAvailable = getAvailableOracleReserve();
+        if (oracleAvailable < budget)
+            revert InsufficientOracleReserve(oracleAvailable, budget);
 
         uint256 balanceBefore = token.balanceOf(address(this));
         token.safeTransferFrom(msg.sender, address(this), bet);
         uint256 received = token.balanceOf(address(this)) - balanceBefore;
         if (received != bet) revert UnsupportedTokenTransfer(bet, received);
 
-        uint256 maxPayout = bet * 2;
-        uint256 availableLiquidity = getAvailableLiquidity();
-        if (availableLiquidity < maxPayout) {
-            revert InsufficientAvailableLiquidity(availableLiquidity, maxPayout);
-        }
-
-        gameId = nextGameId;
-        ++nextGameId;
-
+        gameId = nextGameId++;
         Game storage game = games[gameId];
         game.player = msg.sender;
         game.bet = bet;
         game.maxPayout = maxPayout;
-        game.state = GameState.Created;
-
-        address[3] memory committee = _selectValidators(msg.sender, gameId);
-        for (uint256 index; index < COMMITTEE_SIZE; ++index) {
-            game.selectedValidators[index] = committee[index];
-            _reserveValidator(committee[index]);
-        }
-
+        game.oracleBudgetRemaining = budget;
         lockedLiquidity += maxPayout;
-        game.commitDeadline = block.timestamp + COMMIT_DURATION;
-        game.state = GameState.WaitingForCommits;
-
+        lockedOracleBudget += budget;
         emit PoolGameStarted(gameId, msg.sender, bet, maxPayout);
-        emit ValidatorsSelected(
-            gameId,
-            committee[0],
-            committee[1],
-            committee[2]
-        );
-    }
-
-    function submitPlayerCommit(uint256 gameId, bytes32 commitment) external {
-        Game storage game = _getGame(gameId);
-        _requireState(game, GameState.WaitingForCommits);
-        _requireBeforeDeadline(game.commitDeadline);
-        if (msg.sender != game.player) revert NotGamePlayer(msg.sender);
-        if (game.playerCommitted) revert CommitAlreadySubmitted(msg.sender);
-        if (commitment == bytes32(0)) revert InvalidCommitment();
-
-        game.playerCommit = commitment;
-        game.playerCommitted = true;
-        ++game.commitCount;
-
-        emit CommitSubmitted(gameId, msg.sender, true, commitment);
-        _beginRevealPhaseIfReady(game);
-    }
-
-    function submitValidatorCommit(uint256 gameId, bytes32 commitment) external {
-        Game storage game = _getGame(gameId);
-        _requireState(game, GameState.WaitingForCommits);
-        _requireBeforeDeadline(game.commitDeadline);
-        (bool selected, uint256 validatorIndex) = _findValidator(game, msg.sender);
-        if (!selected) revert NotSelectedValidator(msg.sender);
-        if (game.validatorCommitted[validatorIndex]) {
-            revert CommitAlreadySubmitted(msg.sender);
-        }
-        if (commitment == bytes32(0)) revert InvalidCommitment();
-
-        game.validatorCommits[validatorIndex] = commitment;
-        game.validatorCommitted[validatorIndex] = true;
-        ++game.commitCount;
-
-        emit CommitSubmitted(gameId, msg.sender, false, commitment);
-        _beginRevealPhaseIfReady(game);
-    }
-
-    function revealPlayerSecret(uint256 gameId, bytes32 secret) external {
-        Game storage game = _getGame(gameId);
-        _requireState(game, GameState.WaitingForReveals);
-        _requireBeforeDeadline(game.revealDeadline);
-        if (msg.sender != game.player) revert NotGamePlayer(msg.sender);
-        if (game.playerRevealed) revert SecretAlreadyRevealed(msg.sender);
-        if (_commitmentFor(secret, gameId, msg.sender) != game.playerCommit) {
-            revert SecretDoesNotMatchCommit(msg.sender);
-        }
-
-        game.playerSecret = secret;
-        game.playerRevealed = true;
-        ++game.revealCount;
-
-        emit SecretRevealed(gameId, msg.sender, true);
-        _generateFinalSeedIfReady(gameId, game);
-    }
-
-    function revealValidatorSecret(uint256 gameId, bytes32 secret) external {
-        Game storage game = _getGame(gameId);
-        _requireState(game, GameState.WaitingForReveals);
-        _requireBeforeDeadline(game.revealDeadline);
-        (bool selected, uint256 validatorIndex) = _findValidator(game, msg.sender);
-        if (!selected) revert NotSelectedValidator(msg.sender);
-        if (game.validatorRevealed[validatorIndex]) {
-            revert SecretAlreadyRevealed(msg.sender);
-        }
-        if (
-            _commitmentFor(secret, gameId, msg.sender)
-                != game.validatorCommits[validatorIndex]
-        ) {
-            revert SecretDoesNotMatchCommit(msg.sender);
-        }
-
-        game.validatorSecrets[validatorIndex] = secret;
-        game.validatorRevealed[validatorIndex] = true;
-        ++game.revealCount;
-
-        emit SecretRevealed(gameId, msg.sender, false);
-        _generateFinalSeedIfReady(gameId, game);
-    }
-
-    function computeCommitment(
-        bytes32 secret,
-        uint256 gameId,
-        address participant
-    ) external view returns (bytes32) {
-        return _commitmentFor(secret, gameId, participant);
+        _requestRandomness(gameId, game, RandomnessPhase.InitialDeal);
     }
 
     function hit(uint256 gameId) external nonReentrant {
         Game storage game = _getGame(gameId);
-        _requireState(game, GameState.PlayerTurn);
-        _requireBeforeDeadline(game.actionDeadline);
-        if (msg.sender != game.player) revert NotGamePlayer(msg.sender);
-
-        uint8[] memory currentHand = game.playerCards;
-        if (_calculateHandScore(currentHand) > 21) revert PlayerAlreadyBust();
-
-        uint8 card = _drawCard(game);
-        game.playerCards.push(card);
-        uint8[] memory updatedHand = game.playerCards;
-        uint256 playerScore = _calculateHandScore(updatedHand);
-
-        emit CardDrawn(gameId, true, card, game.playerCards.length);
-        emit PlayerHit(gameId, card, playerScore);
-
-        if (playerScore > 21) {
-            uint8[] memory dealerHand = game.dealerCards;
-            _settleGame(
-                gameId,
-                game,
-                GameResult.DealerWin,
-                playerScore,
-                _calculateHandScore(dealerHand)
-            );
-        } else {
-            game.actionDeadline = block.timestamp + ACTION_DURATION;
-        }
+        _requirePlayerTurn(game);
+        uint8[] memory hand = game.playerCards;
+        if (_calculateHandScore(hand) > 21) revert PlayerAlreadyBust();
+        _requestRandomness(gameId, game, RandomnessPhase.PlayerHit);
     }
 
     function stand(uint256 gameId) external nonReentrant {
         Game storage game = _getGame(gameId);
-        _requireState(game, GameState.PlayerTurn);
-        _requireBeforeDeadline(game.actionDeadline);
-        if (msg.sender != game.player) revert NotGamePlayer(msg.sender);
-
-        uint8[] memory playerHand = game.playerCards;
-        uint256 playerScore = _calculateHandScore(playerHand);
-        emit PlayerStand(gameId, playerScore);
-
-        game.state = GameState.DealerTurn;
-        _resolveDealer(gameId, game, playerScore);
+        _requirePlayerTurn(game);
+        uint8[] memory hand = game.playerCards;
+        emit PlayerStand(gameId, _calculateHandScore(hand));
+        uint8[] memory dealerHand = game.dealerCards;
+        if (_calculateHandScore(dealerHand) >= 17) {
+            game.state = GameState.DealerTurn;
+            game.actionDeadline = 0;
+            _finishDealer(gameId, game);
+        } else {
+            _requestRandomness(gameId, game, RandomnessPhase.Dealer);
+        }
     }
 
-    /// @notice Resolves a game whose current participant deadline has expired.
-    /// @dev Anyone may call this function so an abandoned game cannot keep pool
-    ///      liquidity or validator collateral reserved indefinitely.
+    function _requestRandomness(
+        uint256 gameId,
+        Game storage game,
+        RandomnessPhase phase
+    ) private {
+        game.state = GameState.WaitingForRandomness;
+        game.actionDeadline = 0;
+        game.queuedPhase = phase;
+        game.requestQueued = true;
+        if (!_dispatchRandomness(gameId, game)) {
+            // A new game must fund/request successfully or its bet is rolled back.
+            // Existing players have committed their action and cannot time out
+            // while prices exceed the cap or the wrapper temporarily rejects it.
+            if (phase == RandomnessPhase.InitialDeal)
+                revert OracleUnavailable();
+            emit OracleRequestDeferred(gameId, phase);
+        }
+    }
+
+    /// @notice Sends the FIRST request for a committed action deferred by fees/outage.
+    /// @dev Never replaces an existing request or changes the chosen action.
+    function requestPendingRandomness(uint256 gameId) external nonReentrant {
+        Game storage game = _getGame(gameId);
+        _requireState(game, GameState.WaitingForRandomness);
+        if (!game.requestQueued) revert NoQueuedRandomness();
+        if (!_dispatchRandomness(gameId, game)) revert OracleUnavailable();
+    }
+
+    function _dispatchRandomness(
+        uint256 gameId,
+        Game storage game
+    ) private returns (bool) {
+        if (game.requestCount >= MAX_RANDOMNESS_REQUESTS_PER_GAME)
+            revert OracleRequestLimitReached();
+        uint256 fee;
+        try
+            i_vrfV2PlusWrapper.calculateRequestPriceNative(
+                CALLBACK_GAS_LIMIT,
+                1
+            )
+        returns (uint256 quoted) {
+            if (quoted > maxOracleRequestCost) return false;
+            fee = quoted;
+        } catch {
+            return false;
+        }
+        // The official wrapper consumer base verifies the callback sender.
+        // Calling its native-payment interface directly lets a failed submission
+        // leave an existing action queued, without punishing the player.
+        try
+            i_vrfV2PlusWrapper.requestRandomWordsInNative{value: fee}(
+                CALLBACK_GAS_LIMIT,
+                REQUEST_CONFIRMATIONS,
+                1,
+                VRFV2PlusClient._argsToBytes(
+                    VRFV2PlusClient.ExtraArgsV1({nativePayment: true})
+                )
+            )
+        returns (uint256 requestId) {
+            if (randomnessRequests[requestId].exists)
+                revert InvalidOracleRequest();
+            game.oracleBudgetRemaining -= fee;
+            lockedOracleBudget -= fee;
+            game.oracleSpent += fee;
+            totalOracleSpent += fee;
+            ++game.requestCount;
+            game.requestQueued = false;
+            game.pendingRequestId = requestId;
+            randomnessRequests[requestId] = RandomnessRequest(
+                gameId,
+                game.queuedPhase,
+                true,
+                false,
+                false,
+                0,
+                fee
+            );
+            emit RandomnessRequested(gameId, requestId, game.queuedPhase, fee);
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    /// @dev Only the immutable Chainlink wrapper can reach this callback. Unknown,
+    ///      duplicate, or malformed deliveries are ignored, never rerolled.
+    ///      No token transfers, card draws, or external calls run in the callback.
+    function fulfillRandomWords(
+        uint256 requestId,
+        uint256[] memory words
+    ) internal override {
+        RandomnessRequest storage request = randomnessRequests[requestId];
+        if (!request.exists || request.fulfilled || words.length != 1) return;
+        Game storage game = games[request.gameId];
+        if (
+            game.requestQueued ||
+            game.state != GameState.WaitingForRandomness ||
+            game.pendingRequestId != requestId
+        ) return;
+        request.randomWord = words[0];
+        request.fulfilled = true;
+        game.state = GameState.RandomnessReady;
+        emit RandomnessReceived(request.gameId, requestId);
+    }
+
+    /// @notice Permissionless, retryable processing of an already fixed result.
+    /// @dev A failed token payout leaves the saved oracle response available.
+    function processRandomness(uint256 gameId) external nonReentrant {
+        Game storage game = _getGame(gameId);
+        _requireState(game, GameState.RandomnessReady);
+        RandomnessRequest storage request = randomnessRequests[
+            game.pendingRequestId
+        ];
+        if (!request.fulfilled || request.consumed) revert RandomnessNotReady();
+        request.consumed = true;
+        bytes32 seed = keccak256(
+            abi.encode(
+                block.chainid,
+                address(this),
+                gameId,
+                game.pendingRequestId,
+                request.randomWord
+            )
+        );
+        if (request.phase == RandomnessPhase.InitialDeal) {
+            _dealInitialCards(gameId, game, seed);
+        } else if (request.phase == RandomnessPhase.PlayerHit) {
+            uint8 card = _drawCard(game, seed, 0);
+            game.playerCards.push(card);
+            uint8[] memory hand = game.playerCards;
+            uint256 score = _calculateHandScore(hand);
+            emit CardDrawn(gameId, true, card, hand.length);
+            emit PlayerHit(gameId, card, score);
+            if (score > 21) {
+                uint8[] memory dealerHand = game.dealerCards;
+                _settleGame(
+                    gameId,
+                    game,
+                    GameResult.DealerWin,
+                    score,
+                    _calculateHandScore(dealerHand)
+                );
+            } else {
+                _beginPlayerTurn(game);
+            }
+        } else {
+            game.state = GameState.DealerTurn;
+            uint256 nonce;
+            uint8[] memory dealerHand = game.dealerCards;
+            while (_calculateHandScore(dealerHand) < 17) {
+                uint8 card = _drawCard(game, seed, nonce++);
+                game.dealerCards.push(card);
+                emit CardDrawn(gameId, false, card, game.dealerCards.length);
+                dealerHand = game.dealerCards;
+            }
+            _finishDealer(gameId, game);
+        }
+    }
+
+    function _dealInitialCards(
+        uint256 gameId,
+        Game storage game,
+        bytes32 seed
+    ) private {
+        for (uint256 index; index < 4; ++index) {
+            uint8 card = _drawCard(game, seed, index);
+            bool playerHand = index < 2;
+            if (playerHand) game.playerCards.push(card);
+            else game.dealerCards.push(card);
+            emit CardDrawn(
+                gameId,
+                playerHand,
+                card,
+                playerHand ? game.playerCards.length : game.dealerCards.length
+            );
+        }
+        _beginPlayerTurn(game);
+        emit GameStarted(gameId, game.player);
+    }
+
+    function _beginPlayerTurn(Game storage game) private {
+        game.state = GameState.PlayerTurn;
+        game.actionDeadline = block.timestamp + ACTION_DURATION;
+    }
+
+    /// @dev Each draw removes an index from a virtual deck in bounded work.
+    ///      The seed belongs only to the current committed action, never a future hit.
+    function _drawCard(
+        Game storage game,
+        bytes32 seed,
+        uint256 nonce
+    ) internal returns (uint8 card) {
+        uint8 remaining = 52 - game.cardsDrawn;
+        if (remaining == 0) revert DeckExhausted();
+        uint8 index = uint8(
+            uint256(keccak256(abi.encode(seed, nonce))) % remaining
+        );
+        uint8 stored = game.deck[index];
+        card = stored == 0 ? index : stored - 1;
+        uint8 last = game.deck[remaining - 1];
+        game.deck[index] = last == 0 ? remaining : last;
+        game.drawnCards[card] = true;
+        ++game.cardsDrawn;
+    }
+
+    function _finishDealer(uint256 gameId, Game storage game) private {
+        uint8[] memory playerHand = game.playerCards;
+        uint8[] memory dealerHand = game.dealerCards;
+        uint256 playerScore = _calculateHandScore(playerHand);
+        uint256 dealerScore = _calculateHandScore(dealerHand);
+        bool bust = dealerScore > 21;
+        emit DealerResolved(gameId, dealerScore, bust);
+        GameResult result =
+            bust || playerScore > dealerScore
+                ? GameResult.PlayerWin
+                : dealerScore > playerScore
+                    ? GameResult.DealerWin
+                    : GameResult.Push;
+        _settleGame(gameId, game, result, playerScore, dealerScore);
+    }
+
+    function _settleGame(
+        uint256 gameId,
+        Game storage game,
+        GameResult result,
+        uint256 playerScore,
+        uint256 dealerScore
+    ) private {
+        game.state = GameState.Finished;
+        game.result = result;
+        game.actionDeadline = 0;
+        lockedLiquidity -= game.maxPayout;
+        lockedOracleBudget -= game.oracleBudgetRemaining;
+        game.oracleBudgetRemaining = 0;
+        uint256 payout;
+        if (result == GameResult.PlayerWin) {
+            poolBalance -= game.bet;
+            payout = game.maxPayout;
+        } else if (result == GameResult.DealerWin) {
+            poolBalance += game.bet;
+        } else {
+            payout = game.bet;
+        }
+        game.payout = payout;
+        if (payout != 0) token.safeTransfer(game.player, payout);
+        emit GameFinished(gameId, result, payout, playerScore, dealerScore);
+    }
+
+    /// @notice Only player inactivity can time out; oracle results cannot be discarded.
     function claimTimeout(uint256 gameId) external nonReentrant {
         Game storage game = _getGame(gameId);
-        GameState timedOutState = game.state;
-        uint256 deadline;
-
-        if (timedOutState == GameState.WaitingForCommits) {
-            deadline = game.commitDeadline;
-        } else if (timedOutState == GameState.WaitingForReveals) {
-            deadline = game.revealDeadline;
-        } else if (timedOutState == GameState.PlayerTurn) {
-            deadline = game.actionDeadline;
-        } else {
-            revert TimeoutUnavailable(timedOutState);
-        }
-
-        if (block.timestamp <= deadline) {
-            revert GameDeadlineNotReached(deadline, block.timestamp);
-        }
-
-        emit TimeoutClaimed(gameId, msg.sender, timedOutState);
-
-        if (timedOutState == GameState.PlayerTurn) {
-            uint8[] memory playerHand = game.playerCards;
-            uint8[] memory dealerHand = game.dealerCards;
-            uint256 playerScore = _calculateHandScore(playerHand);
-            uint256 dealerScore = _calculateHandScore(dealerHand);
-
-            emit PlayerPenalized(gameId, game.player, game.bet);
-            _settleGame(
-                gameId,
-                game,
-                GameResult.DealerWin,
-                playerScore,
-                dealerScore
-            );
-            return;
-        }
-
-        bool playerDefaulted = timedOutState == GameState.WaitingForCommits
-            ? !game.playerCommitted
-            : !game.playerRevealed;
-
-        for (uint256 index; index < COMMITTEE_SIZE; ++index) {
-            bool validatorDefaulted = timedOutState
-                == GameState.WaitingForCommits
-                ? !game.validatorCommitted[index]
-                : !game.validatorRevealed[index];
-
-            if (validatorDefaulted) {
-                _slashValidator(
-                    gameId,
-                    game.selectedValidators[index],
-                    VALIDATOR_SLASH_AMOUNT
-                );
-            }
-        }
-
-        _cancelTimedOutGame(gameId, game, playerDefaulted);
+        if (game.state != GameState.PlayerTurn)
+            revert TimeoutUnavailable(game.state);
+        if (block.timestamp <= game.actionDeadline)
+            revert GameDeadlineNotReached(game.actionDeadline, block.timestamp);
+        uint8[] memory playerHand = game.playerCards;
+        uint8[] memory dealerHand = game.dealerCards;
+        emit TimeoutClaimed(gameId, msg.sender, game.state);
+        emit PlayerPenalized(gameId, game.player, game.bet);
+        _settleGame(
+            gameId,
+            game,
+            GameResult.DealerWin,
+            _calculateHandScore(playerHand),
+            _calculateHandScore(dealerHand)
+        );
     }
 
-    function getGameCore(uint256 gameId)
+    function getGameCore(
+        uint256 gameId
+    )
         external
         view
         returns (
@@ -543,118 +575,71 @@ contract FairJackPool is ReentrancyGuard {
         Game storage game = _getGame(gameId);
         return (game.player, game.bet, game.maxPayout, game.state);
     }
-
-    function getGameValidators(uint256 gameId)
-        external
-        view
-        returns (address[3] memory)
-    {
-        return _getGame(gameId).selectedValidators;
-    }
-
-    function getGameDeadlines(uint256 gameId)
+    function getGameRandomness(
+        uint256 gameId
+    )
         external
         view
         returns (
-            uint256 commitDeadline,
-            uint256 revealDeadline,
-            uint256 actionDeadline
+            uint256 requestId,
+            RandomnessPhase phase,
+            uint256 requestCount,
+            bool fulfilled,
+            bool consumed,
+            uint256 oracleSpent,
+            uint256 oracleBudgetRemaining,
+            bool queued
         )
     {
         Game storage game = _getGame(gameId);
+        RandomnessRequest storage request = randomnessRequests[
+            game.pendingRequestId
+        ];
         return (
-            game.commitDeadline,
-            game.revealDeadline,
-            game.actionDeadline
+            game.requestQueued ? 0 : game.pendingRequestId,
+            game.queuedPhase,
+            game.requestCount,
+            !game.requestQueued && request.fulfilled,
+            !game.requestQueued && request.consumed,
+            game.oracleSpent,
+            game.oracleBudgetRemaining,
+            game.requestQueued
         );
     }
-
-    function getGameRandomnessProgress(uint256 gameId)
-        external
-        view
-        returns (
-            bytes32 playerCommit,
-            bool playerCommitted,
-            bool playerRevealed,
-            uint8 commitCount,
-            uint8 revealCount,
-            bytes32 finalSeed
-        )
-    {
-        Game storage game = _getGame(gameId);
-        return (
-            game.playerCommit,
-            game.playerCommitted,
-            game.playerRevealed,
-            game.commitCount,
-            game.revealCount,
-            game.finalSeed
-        );
+    function getActionDeadline(uint256 gameId) external view returns (uint256) {
+        return _getGame(gameId).actionDeadline;
     }
-
-    function getValidatorRandomnessStatus(uint256 gameId, address validator)
-        external
-        view
-        returns (
-            bytes32 commitment,
-            bool committed,
-            bool revealed
-        )
-    {
-        Game storage game = _getGame(gameId);
-        (bool selected, uint256 validatorIndex) = _findValidator(game, validator);
-        if (!selected) revert NotSelectedValidator(validator);
-        return (
-            game.validatorCommits[validatorIndex],
-            game.validatorCommitted[validatorIndex],
-            game.validatorRevealed[validatorIndex]
-        );
-    }
-
-    function getPlayerCards(uint256 gameId)
-        external
-        view
-        returns (uint8[] memory)
-    {
+    function getPlayerCards(
+        uint256 gameId
+    ) external view returns (uint8[] memory) {
         return _getGame(gameId).playerCards;
     }
-
-    function getDealerCards(uint256 gameId)
-        external
-        view
-        returns (uint8[] memory)
-    {
+    function getDealerCards(
+        uint256 gameId
+    ) external view returns (uint8[] memory) {
         return _getGame(gameId).dealerCards;
     }
-
-    function getCardNonce(uint256 gameId) external view returns (uint256) {
-        return _getGame(gameId).cardNonce;
+    function getCardsDrawn(uint256 gameId) external view returns (uint256) {
+        return _getGame(gameId).cardsDrawn;
     }
-
-    function isCardDrawn(uint256 gameId, uint8 card)
-        external
-        view
-        returns (bool)
-    {
+    function isCardDrawn(
+        uint256 gameId,
+        uint8 card
+    ) external view returns (bool) {
         if (card >= 52) return false;
         return _getGame(gameId).drawnCards[card];
     }
-
     function getPlayerScore(uint256 gameId) external view returns (uint256) {
         uint8[] memory cards = _getGame(gameId).playerCards;
         return _calculateHandScore(cards);
     }
-
     function getDealerScore(uint256 gameId) external view returns (uint256) {
         uint8[] memory cards = _getGame(gameId).dealerCards;
         return _calculateHandScore(cards);
     }
-
-    function getGameResult(uint256 gameId)
-        external
-        view
-        returns (GameResult result, uint256 payout)
-    {
+    function getGameResult(
+        uint256 gameId
+    ) external view returns (GameResult result, uint256 payout) {
         Game storage game = _getGame(gameId);
         return (game.result, game.payout);
     }
@@ -663,6 +648,8 @@ contract FairJackPool is ReentrancyGuard {
     /// @param amount Amount of tokens to deposit, expressed in token base units.
     function depositToHousePool(uint256 amount) external nonReentrant {
         if (amount == 0) revert ZeroAmount();
+        // Published/pending VRF results must not allow share trading at a stale NAV.
+        if (lockedLiquidity != 0) revert ActiveGamesPreventShareChanges();
 
         uint256 sharesMinted;
         if (totalShares == 0) {
@@ -676,7 +663,8 @@ contract FairJackPool is ReentrancyGuard {
         uint256 balanceBefore = token.balanceOf(address(this));
         token.safeTransferFrom(msg.sender, address(this), amount);
         uint256 received = token.balanceOf(address(this)) - balanceBefore;
-        if (received != amount) revert UnsupportedTokenTransfer(amount, received);
+        if (received != amount)
+            revert UnsupportedTokenTransfer(amount, received);
 
         poolBalance += amount;
         totalShares += sharesMinted;
@@ -701,6 +689,8 @@ contract FairJackPool is ReentrancyGuard {
             revert InsufficientAvailableLiquidity(availableLiquidity, amount);
         }
 
+        if (lockedLiquidity != 0) revert ActiveGamesPreventShareChanges();
+
         sharesOf[msg.sender] = userShares - shares;
         totalShares -= shares;
         poolBalance -= amount;
@@ -708,7 +698,8 @@ contract FairJackPool is ReentrancyGuard {
         uint256 balanceBefore = token.balanceOf(msg.sender);
         token.safeTransfer(msg.sender, amount);
         uint256 received = token.balanceOf(msg.sender) - balanceBefore;
-        if (received != amount) revert UnsupportedTokenTransfer(amount, received);
+        if (received != amount)
+            revert UnsupportedTokenTransfer(amount, received);
 
         emit PoolWithdraw(msg.sender, amount, shares);
     }
@@ -728,115 +719,9 @@ contract FairJackPool is ReentrancyGuard {
         return (poolBalance * 1e18) / totalShares;
     }
 
-    function _selectValidators(address player, uint256 selectionSalt)
-        internal
-        view
-        returns (address[3] memory committee)
-    {
-        uint256 validatorCount = validatorList.length;
-        if (validatorCount < COMMITTEE_SIZE) {
-            revert InsufficientEligibleValidators(COMMITTEE_SIZE, validatorCount);
-        }
-
-        uint256 startIndex = uint256(
-            keccak256(abi.encode(player, selectionSalt, address(this)))
-        ) % validatorCount;
-        uint256 selected;
-
-        for (uint256 offset; offset < validatorCount && selected < COMMITTEE_SIZE; ++offset) {
-            address candidate = validatorList[(startIndex + offset) % validatorCount];
-            ValidatorInfo storage info = validators[candidate];
-
-            if (
-                candidate != player && info.registered
-                    && info.activeGames < MAX_VALIDATOR_ACTIVE_GAMES
-                    && info.collateral
-                        >= (info.activeGames + 1) * VALIDATOR_COLLATERAL_PER_GAME
-            ) {
-                committee[selected] = candidate;
-                ++selected;
-            }
-        }
-
-        if (selected != COMMITTEE_SIZE) {
-            revert InsufficientEligibleValidators(COMMITTEE_SIZE, selected);
-        }
-    }
-
-    function _reserveValidator(address validator) internal {
-        ValidatorInfo storage info = validators[validator];
-        if (
-            !info.registered || info.activeGames >= MAX_VALIDATOR_ACTIVE_GAMES
-                || info.collateral
-                    < (info.activeGames + 1) * VALIDATOR_COLLATERAL_PER_GAME
-        ) {
-            revert ValidatorCapacityReached(validator);
-        }
-
-        ++info.activeGames;
-    }
-
-    function _beginRevealPhaseIfReady(Game storage game) private {
-        if (game.commitCount == COMMITTEE_SIZE + 1) {
-            game.state = GameState.WaitingForReveals;
-            game.revealDeadline = block.timestamp + REVEAL_DURATION;
-        }
-    }
-
-    function _commitmentFor(
-        bytes32 secret,
-        uint256 gameId,
-        address participant
-    ) private view returns (bytes32) {
-        return keccak256(
-            abi.encode(secret, gameId, participant, address(this))
-        );
-    }
-
-    function _generateFinalSeedIfReady(uint256 gameId, Game storage game) private {
-        if (game.revealCount == COMMITTEE_SIZE + 1) {
-            game.finalSeed = keccak256(
-                abi.encode(
-                    gameId,
-                    game.playerSecret,
-                    game.validatorSecrets[0],
-                    game.validatorSecrets[1],
-                    game.validatorSecrets[2],
-                    address(this)
-                )
-            );
-
-            emit FinalSeedGenerated(gameId, game.finalSeed);
-            _dealInitialCards(gameId, game);
-        }
-    }
-
-    function _drawCard(Game storage game) internal returns (uint8 card) {
-        if (game.finalSeed == bytes32(0)) revert RandomnessNotReady();
-        if (game.playerCards.length + game.dealerCards.length == 52) {
-            revert DeckExhausted();
-        }
-
-        while (true) {
-            card = uint8(
-                uint256(
-                    keccak256(abi.encode(game.finalSeed, game.cardNonce))
-                ) % 52
-            );
-            ++game.cardNonce;
-
-            if (!game.drawnCards[card]) {
-                game.drawnCards[card] = true;
-                return card;
-            }
-        }
-    }
-
-    function _calculateHandScore(uint8[] memory cards)
-        internal
-        pure
-        returns (uint256 score)
-    {
+    function _calculateHandScore(
+        uint8[] memory cards
+    ) internal pure returns (uint256 score) {
         uint256 aces;
 
         for (uint256 index; index < cards.length; ++index) {
@@ -860,200 +745,19 @@ contract FairJackPool is ReentrancyGuard {
         }
     }
 
-    function _dealInitialCards(uint256 gameId, Game storage game) private {
-        for (uint256 index; index < 2; ++index) {
-            uint8 playerCard = _drawCard(game);
-            game.playerCards.push(playerCard);
-            emit CardDrawn(
-                gameId,
-                true,
-                playerCard,
-                game.playerCards.length
-            );
-        }
-
-        for (uint256 index; index < 2; ++index) {
-            uint8 dealerCard = _drawCard(game);
-            game.dealerCards.push(dealerCard);
-            emit CardDrawn(
-                gameId,
-                false,
-                dealerCard,
-                game.dealerCards.length
-            );
-        }
-
-        game.state = GameState.PlayerTurn;
-        game.actionDeadline = block.timestamp + ACTION_DURATION;
-
-        emit GameStarted(gameId, game.player);
+    function _requirePlayerTurn(Game storage game) private view {
+        _requireState(game, GameState.PlayerTurn);
+        if (msg.sender != game.player) revert NotGamePlayer(msg.sender);
+        if (block.timestamp > game.actionDeadline)
+            revert GameDeadlinePassed(game.actionDeadline, block.timestamp);
     }
-
-    function _resolveDealer(
-        uint256 gameId,
-        Game storage game,
-        uint256 playerScore
-    ) private {
-        uint8[] memory dealerHand = game.dealerCards;
-        uint256 dealerScore = _calculateHandScore(dealerHand);
-
-        while (dealerScore < 17) {
-            uint8 card = _drawCard(game);
-            game.dealerCards.push(card);
-            dealerHand = game.dealerCards;
-            dealerScore = _calculateHandScore(dealerHand);
-            emit CardDrawn(gameId, false, card, game.dealerCards.length);
-        }
-
-        bool dealerBust = dealerScore > 21;
-        emit DealerResolved(gameId, dealerScore, dealerBust);
-
-        GameResult result;
-        if (dealerBust || playerScore > dealerScore) {
-            result = GameResult.PlayerWin;
-        } else if (dealerScore > playerScore) {
-            result = GameResult.DealerWin;
-        } else {
-            result = GameResult.Push;
-        }
-
-        _settleGame(gameId, game, result, playerScore, dealerScore);
-    }
-
-    function _settleGame(
-        uint256 gameId,
-        Game storage game,
-        GameResult result,
-        uint256 playerScore,
-        uint256 dealerScore
-    ) private {
-        game.state = GameState.Finished;
-        game.result = result;
-        lockedLiquidity -= game.maxPayout;
-
-        for (uint256 index; index < COMMITTEE_SIZE; ++index) {
-            --validators[game.selectedValidators[index]].activeGames;
-        }
-
-        uint256 payout;
-        if (result == GameResult.PlayerWin) {
-            poolBalance -= game.bet;
-            payout = game.maxPayout;
-        } else if (result == GameResult.DealerWin) {
-            poolBalance += game.bet;
-        } else {
-            payout = game.bet;
-        }
-        game.payout = payout;
-
-        if (payout != 0) {
-            token.safeTransfer(game.player, payout);
-        }
-
-        emit GameFinished(
-            gameId,
-            result,
-            payout,
-            playerScore,
-            dealerScore
-        );
-    }
-
-    function _cancelTimedOutGame(
-        uint256 gameId,
-        Game storage game,
-        bool playerDefaulted
-    ) private {
-        game.state = GameState.Cancelled;
-        lockedLiquidity -= game.maxPayout;
-
-        for (uint256 index; index < COMMITTEE_SIZE; ++index) {
-            --validators[game.selectedValidators[index]].activeGames;
-        }
-
-        uint256 refund;
-        if (playerDefaulted) {
-            poolBalance += game.bet;
-            emit PlayerPenalized(gameId, game.player, game.bet);
-        } else {
-            refund = game.bet;
-            game.payout = refund;
-        }
-
-        if (refund != 0) {
-            token.safeTransfer(game.player, refund);
-        }
-
-        emit GameCancelled(gameId);
-    }
-
-    function _slashValidator(
-        uint256 gameId,
-        address validator,
-        uint256 amount
-    ) private {
-        ValidatorInfo storage info = validators[validator];
-        uint256 slashAmount = amount < info.collateral
-            ? amount
-            : info.collateral;
-
-        info.collateral -= slashAmount;
-        ++info.slashCount;
-        poolBalance += slashAmount;
-
-        emit ValidatorSlashed(gameId, validator, slashAmount);
-    }
-
-    function _findValidator(Game storage game, address participant)
-        private
-        view
-        returns (bool selected, uint256 validatorIndex)
-    {
-        for (uint256 index; index < COMMITTEE_SIZE; ++index) {
-            if (game.selectedValidators[index] == participant) {
-                return (true, index);
-            }
-        }
-    }
-
     function _requireState(Game storage game, GameState expected) private view {
-        if (game.state != expected) {
+        if (game.state != expected)
             revert InvalidGameState(expected, game.state);
-        }
     }
-
-    function _requireBeforeDeadline(uint256 deadline) private view {
-        if (block.timestamp > deadline) {
-            revert GameDeadlinePassed(deadline, block.timestamp);
-        }
-    }
-
-    function _requiredValidatorCollateral(uint256 activeGames)
-        internal
-        pure
-        returns (uint256)
-    {
-        uint256 activeRequirement = activeGames * VALIDATOR_COLLATERAL_PER_GAME;
-        return activeRequirement > MIN_VALIDATOR_COLLATERAL
-            ? activeRequirement
-            : MIN_VALIDATOR_COLLATERAL;
-    }
-
-    function _removeValidator(address validator) private {
-        uint256 validatorCount = validatorList.length;
-        for (uint256 index; index < validatorCount; ++index) {
-            if (validatorList[index] == validator) {
-                uint256 lastIndex = validatorCount - 1;
-                if (index != lastIndex) {
-                    validatorList[index] = validatorList[lastIndex];
-                }
-                validatorList.pop();
-                return;
-            }
-        }
-    }
-
-    function _getGame(uint256 gameId) internal view returns (Game storage game) {
+    function _getGame(
+        uint256 gameId
+    ) internal view returns (Game storage game) {
         game = games[gameId];
         if (game.player == address(0)) revert GameDoesNotExist(gameId);
     }

@@ -2,10 +2,19 @@
 pragma solidity ^0.8.28;
 
 import {FairJackPool} from "../contracts/FairJackPool.sol";
+import {MockVRFWrapper} from "../contracts/test/MockVRFWrapper.sol";
 import {MockERC20} from "../contracts/MockERC20.sol";
 
 contract FairJackPoolHarness is FairJackPool {
-    constructor(address tokenAddress) FairJackPool(tokenAddress) {}
+    constructor(
+        address tokenAddress
+    )
+        FairJackPool(
+            tokenAddress,
+            address(new MockVRFWrapper(tokenAddress)),
+            0.001 ether
+        )
+    {}
 
     function setLockedLiquidity(uint256 amount) external {
         lockedLiquidity = amount;
@@ -21,7 +30,11 @@ contract FairJackPoolHarness is FairJackPool {
 }
 
 contract FeeOnTransferToken is MockERC20 {
-    function _update(address from, address to, uint256 value) internal override {
+    function _update(
+        address from,
+        address to,
+        uint256 value
+    ) internal override {
         if (from != address(0) && to != address(0)) {
             uint256 fee = value / 100;
             super._update(from, to, value - fee);
@@ -33,7 +46,11 @@ contract FeeOnTransferToken is MockERC20 {
 }
 
 contract PoolUser {
-    function approveAndDeposit(MockERC20 token, FairJackPool pool, uint256 amount) external {
+    function approveAndDeposit(
+        MockERC20 token,
+        FairJackPool pool,
+        uint256 amount
+    ) external {
         token.approve(address(pool), amount);
         pool.depositToHousePool(amount);
     }
@@ -51,7 +68,7 @@ contract FairJackPoolTest {
     function setUp() public {
         token = new MockERC20();
         poolHarness = new FairJackPoolHarness(address(token));
-        pool = FairJackPool(address(poolHarness));
+        pool = FairJackPool(payable(address(poolHarness)));
     }
 
     function testMintAndApprove() public {
@@ -59,9 +76,15 @@ contract FairJackPoolTest {
         token.mint(address(this), amount);
         token.approve(address(pool), amount);
 
-        require(token.balanceOf(address(this)) == amount, "mint balance mismatch");
+        require(
+            token.balanceOf(address(this)) == amount,
+            "mint balance mismatch"
+        );
         require(token.totalSupply() == amount, "total supply mismatch");
-        require(token.allowance(address(this), address(pool)) == amount, "allowance mismatch");
+        require(
+            token.allowance(address(this), address(pool)) == amount,
+            "allowance mismatch"
+        );
     }
 
     function testInitialDepositMintsSharesOneToOne() public {
@@ -70,7 +93,10 @@ contract FairJackPoolTest {
         token.approve(address(pool), amount);
         pool.depositToHousePool(amount);
 
-        require(token.balanceOf(address(pool)) == amount, "pool token balance mismatch");
+        require(
+            token.balanceOf(address(pool)) == amount,
+            "pool token balance mismatch"
+        );
         require(pool.poolBalance() == amount, "pool accounting mismatch");
         require(pool.totalShares() == amount, "total shares mismatch");
         require(pool.sharesOf(address(this)) == amount, "user shares mismatch");
@@ -87,9 +113,18 @@ contract FairJackPoolTest {
         token.mint(address(secondUser), secondAmount);
         secondUser.approveAndDeposit(token, pool, secondAmount);
 
-        require(pool.poolBalance() == firstAmount + secondAmount, "combined pool balance mismatch");
-        require(pool.totalShares() == firstAmount + secondAmount, "combined shares mismatch");
-        require(pool.sharesOf(address(secondUser)) == secondAmount, "second user shares mismatch");
+        require(
+            pool.poolBalance() == firstAmount + secondAmount,
+            "combined pool balance mismatch"
+        );
+        require(
+            pool.totalShares() == firstAmount + secondAmount,
+            "combined shares mismatch"
+        );
+        require(
+            pool.sharesOf(address(secondUser)) == secondAmount,
+            "second user shares mismatch"
+        );
     }
 
     function testDepositUsesProportionalSharePriceAfterPoolProfit() public {
@@ -108,37 +143,67 @@ contract FairJackPoolTest {
         secondUser.approveAndDeposit(token, pool, secondDeposit);
 
         uint256 expectedShares = 40 ether;
-        require(pool.sharesOf(address(secondUser)) == expectedShares, "proportional shares mismatch");
-        require(pool.totalShares() == initialDeposit + expectedShares, "proportional total shares mismatch");
-        require(pool.poolBalance() == initialDeposit + profit + secondDeposit, "profit pool balance mismatch");
+        require(
+            pool.sharesOf(address(secondUser)) == expectedShares,
+            "proportional shares mismatch"
+        );
+        require(
+            pool.totalShares() == initialDeposit + expectedShares,
+            "proportional total shares mismatch"
+        );
+        require(
+            pool.poolBalance() == initialDeposit + profit + secondDeposit,
+            "profit pool balance mismatch"
+        );
     }
 
     function testDepositRejectsZeroAmount() public {
-        (bool success, bytes memory result) =
-            address(pool).call(abi.encodeCall(FairJackPool.depositToHousePool, (0)));
+        (bool success, bytes memory result) = address(pool).call(
+            abi.encodeCall(FairJackPool.depositToHousePool, (0))
+        );
 
         require(!success, "zero deposit should revert");
-        require(_revertSelector(result) == FairJackPool.ZeroAmount.selector, "wrong zero deposit error");
+        require(
+            _revertSelector(result) == FairJackPool.ZeroAmount.selector,
+            "wrong zero deposit error"
+        );
     }
 
-    function testDepositRejectsFeeOnTransferTokenWithoutChangingBalances() public {
+    function testDepositRejectsFeeOnTransferTokenWithoutChangingBalances()
+        public
+    {
         FeeOnTransferToken feeToken = new FeeOnTransferToken();
-        FairJackPool feePool = new FairJackPool(address(feeToken));
+        FairJackPool feePool = new FairJackPool(
+            address(feeToken),
+            address(new MockVRFWrapper(address(feeToken))),
+            0.001 ether
+        );
         uint256 amount = 100 ether;
         feeToken.mint(address(this), amount);
         feeToken.approve(address(feePool), amount);
 
-        (bool success, bytes memory result) =
-            address(feePool).call(abi.encodeCall(FairJackPool.depositToHousePool, (amount)));
+        (bool success, bytes memory result) = address(feePool).call(
+            abi.encodeCall(FairJackPool.depositToHousePool, (amount))
+        );
 
         require(!success, "fee-on-transfer deposit should revert");
         require(
-            _revertSelector(result) == FairJackPool.UnsupportedTokenTransfer.selector,
+            _revertSelector(result) ==
+                FairJackPool.UnsupportedTokenTransfer.selector,
             "wrong unsupported token error"
         );
-        require(feeToken.balanceOf(address(this)) == amount, "failed deposit changed user tokens");
-        require(feeToken.balanceOf(address(feePool)) == 0, "failed deposit changed pool tokens");
-        require(feePool.poolBalance() == 0, "failed deposit changed accounting");
+        require(
+            feeToken.balanceOf(address(this)) == amount,
+            "failed deposit changed user tokens"
+        );
+        require(
+            feeToken.balanceOf(address(feePool)) == 0,
+            "failed deposit changed pool tokens"
+        );
+        require(
+            feePool.poolBalance() == 0,
+            "failed deposit changed accounting"
+        );
     }
 
     function testDepositRejectsInsolventPoolExplicitly() public {
@@ -148,12 +213,19 @@ contract FairJackPoolTest {
         pool.depositToHousePool(amount);
         poolHarness.erasePoolBalance();
 
-        (bool success, bytes memory result) =
-            address(pool).call(abi.encodeCall(FairJackPool.depositToHousePool, (amount)));
+        (bool success, bytes memory result) = address(pool).call(
+            abi.encodeCall(FairJackPool.depositToHousePool, (amount))
+        );
 
         require(!success, "insolvent pool deposit should revert");
-        require(_revertSelector(result) == FairJackPool.InsolventPool.selector, "wrong insolvency error");
-        require(pool.totalShares() == amount, "failed insolvent deposit changed shares");
+        require(
+            _revertSelector(result) == FairJackPool.InsolventPool.selector,
+            "wrong insolvency error"
+        );
+        require(
+            pool.totalShares() == amount,
+            "failed insolvent deposit changed shares"
+        );
     }
 
     function testPartialWithdrawalBurnsSharesAndReturnsTokens() public {
@@ -165,11 +237,26 @@ contract FairJackPoolTest {
 
         pool.withdrawFromHousePool(sharesToWithdraw);
 
-        require(token.balanceOf(address(this)) == sharesToWithdraw, "withdrawn token balance mismatch");
-        require(token.balanceOf(address(pool)) == depositAmount - sharesToWithdraw, "contract balance mismatch");
-        require(pool.poolBalance() == depositAmount - sharesToWithdraw, "pool balance after withdraw mismatch");
-        require(pool.totalShares() == depositAmount - sharesToWithdraw, "total shares after withdraw mismatch");
-        require(pool.sharesOf(address(this)) == depositAmount - sharesToWithdraw, "user shares after withdraw mismatch");
+        require(
+            token.balanceOf(address(this)) == sharesToWithdraw,
+            "withdrawn token balance mismatch"
+        );
+        require(
+            token.balanceOf(address(pool)) == depositAmount - sharesToWithdraw,
+            "contract balance mismatch"
+        );
+        require(
+            pool.poolBalance() == depositAmount - sharesToWithdraw,
+            "pool balance after withdraw mismatch"
+        );
+        require(
+            pool.totalShares() == depositAmount - sharesToWithdraw,
+            "total shares after withdraw mismatch"
+        );
+        require(
+            pool.sharesOf(address(this)) == depositAmount - sharesToWithdraw,
+            "user shares after withdraw mismatch"
+        );
     }
 
     function testFullWithdrawalResetsPoolAccounting() public {
@@ -180,12 +267,18 @@ contract FairJackPoolTest {
 
         pool.withdrawFromHousePool(amount);
 
-        require(token.balanceOf(address(this)) == amount, "full withdrawal token mismatch");
+        require(
+            token.balanceOf(address(this)) == amount,
+            "full withdrawal token mismatch"
+        );
         require(token.balanceOf(address(pool)) == 0, "pool retained tokens");
         require(pool.poolBalance() == 0, "pool balance not reset");
         require(pool.totalShares() == 0, "total shares not reset");
         require(pool.sharesOf(address(this)) == 0, "user shares not reset");
-        require(pool.getSharePrice() == 1 ether, "empty pool share price mismatch");
+        require(
+            pool.getSharePrice() == 1 ether,
+            "empty pool share price mismatch"
+        );
     }
 
     function testTwoUsersRecoverProportionalValueAfterProfit() public {
@@ -205,28 +298,57 @@ contract FairJackPoolTest {
         secondUser.withdraw(pool, 40 ether);
         pool.withdrawFromHousePool(firstDeposit);
 
-        require(token.balanceOf(address(secondUser)) == secondDeposit, "second user value mismatch");
-        require(token.balanceOf(address(this)) == firstDeposit + profit, "first user profit mismatch");
-        require(token.balanceOf(address(pool)) == 0, "pool token conservation mismatch");
-        require(pool.poolBalance() == 0, "pool accounting conservation mismatch");
+        require(
+            token.balanceOf(address(secondUser)) == secondDeposit,
+            "second user value mismatch"
+        );
+        require(
+            token.balanceOf(address(this)) == firstDeposit + profit,
+            "first user profit mismatch"
+        );
+        require(
+            token.balanceOf(address(pool)) == 0,
+            "pool token conservation mismatch"
+        );
+        require(
+            pool.poolBalance() == 0,
+            "pool accounting conservation mismatch"
+        );
         require(pool.totalShares() == 0, "share conservation mismatch");
     }
 
-    function testWithdrawalRejectsInsufficientSharesWithoutChangingState() public {
+    function testWithdrawalRejectsInsufficientSharesWithoutChangingState()
+        public
+    {
         uint256 depositAmount = 100 ether;
         token.mint(address(this), depositAmount);
         token.approve(address(pool), depositAmount);
         pool.depositToHousePool(depositAmount);
 
         (bool success, bytes memory result) = address(pool).call(
-            abi.encodeCall(FairJackPool.withdrawFromHousePool, (depositAmount + 1))
+            abi.encodeCall(
+                FairJackPool.withdrawFromHousePool,
+                (depositAmount + 1)
+            )
         );
 
         require(!success, "excess withdrawal should revert");
-        require(_revertSelector(result) == FairJackPool.InsufficientShares.selector, "wrong shares error");
-        require(pool.poolBalance() == depositAmount, "failed withdrawal changed pool balance");
-        require(pool.totalShares() == depositAmount, "failed withdrawal changed total shares");
-        require(pool.sharesOf(address(this)) == depositAmount, "failed withdrawal changed user shares");
+        require(
+            _revertSelector(result) == FairJackPool.InsufficientShares.selector,
+            "wrong shares error"
+        );
+        require(
+            pool.poolBalance() == depositAmount,
+            "failed withdrawal changed pool balance"
+        );
+        require(
+            pool.totalShares() == depositAmount,
+            "failed withdrawal changed total shares"
+        );
+        require(
+            pool.sharesOf(address(this)) == depositAmount,
+            "failed withdrawal changed user shares"
+        );
     }
 
     function testWithdrawalRejectsLockedLiquidityWithoutChangingState() public {
@@ -236,34 +358,61 @@ contract FairJackPoolTest {
         pool.depositToHousePool(depositAmount);
         poolHarness.setLockedLiquidity(80 ether);
 
-        (bool success, bytes memory result) =
-            address(pool).call(abi.encodeCall(FairJackPool.withdrawFromHousePool, (30 ether)));
+        (bool success, bytes memory result) = address(pool).call(
+            abi.encodeCall(FairJackPool.withdrawFromHousePool, (30 ether))
+        );
 
         require(!success, "locked liquidity withdrawal should revert");
         require(
-            _revertSelector(result) == FairJackPool.InsufficientAvailableLiquidity.selector,
+            _revertSelector(result) ==
+                FairJackPool.InsufficientAvailableLiquidity.selector,
             "wrong liquidity error"
         );
-        require(pool.poolBalance() == depositAmount, "failed withdrawal changed pool balance");
-        require(pool.totalShares() == depositAmount, "failed withdrawal changed total shares");
-        require(pool.sharesOf(address(this)) == depositAmount, "failed withdrawal changed user shares");
+        require(
+            pool.poolBalance() == depositAmount,
+            "failed withdrawal changed pool balance"
+        );
+        require(
+            pool.totalShares() == depositAmount,
+            "failed withdrawal changed total shares"
+        );
+        require(
+            pool.sharesOf(address(this)) == depositAmount,
+            "failed withdrawal changed user shares"
+        );
     }
 
     function testWithdrawalRejectsZeroShares() public {
-        (bool success, bytes memory result) =
-            address(pool).call(abi.encodeCall(FairJackPool.withdrawFromHousePool, (0)));
+        (bool success, bytes memory result) = address(pool).call(
+            abi.encodeCall(FairJackPool.withdrawFromHousePool, (0))
+        );
 
         require(!success, "zero-share withdrawal should revert");
-        require(_revertSelector(result) == FairJackPool.ZeroShares.selector, "wrong zero shares error");
+        require(
+            _revertSelector(result) == FairJackPool.ZeroShares.selector,
+            "wrong zero shares error"
+        );
     }
 
     function testInitialPoolViewsAndTokenAddress() public view {
-        require(address(pool.token()) == address(token), "configured token mismatch");
+        require(
+            address(pool.token()) == address(token),
+            "configured token mismatch"
+        );
         require(pool.poolBalance() == 0, "initial pool balance should be zero");
-        require(pool.lockedLiquidity() == 0, "initial locked liquidity should be zero");
+        require(
+            pool.lockedLiquidity() == 0,
+            "initial locked liquidity should be zero"
+        );
         require(pool.totalShares() == 0, "initial shares should be zero");
-        require(pool.getAvailableLiquidity() == 0, "initial available liquidity should be zero");
-        require(pool.getSharePrice() == 1 ether, "initial share price mismatch");
+        require(
+            pool.getAvailableLiquidity() == 0,
+            "initial available liquidity should be zero"
+        );
+        require(
+            pool.getSharePrice() == 1 ether,
+            "initial share price mismatch"
+        );
     }
 
     function testAvailableLiquiditySubtractsLockedFunds() public {
@@ -273,7 +422,10 @@ contract FairJackPoolTest {
         pool.depositToHousePool(depositAmount);
         poolHarness.setLockedLiquidity(35 ether);
 
-        require(pool.getAvailableLiquidity() == 65 ether, "available liquidity mismatch");
+        require(
+            pool.getAvailableLiquidity() == 65 ether,
+            "available liquidity mismatch"
+        );
     }
 
     function testSharePriceReflectsPoolProfit() public {
@@ -285,18 +437,33 @@ contract FairJackPoolTest {
         token.mint(address(pool), profit);
         poolHarness.recordPoolProfit(profit);
 
-        require(pool.getSharePrice() == 1.5 ether, "share price after profit mismatch");
+        require(
+            pool.getSharePrice() == 1.5 ether,
+            "share price after profit mismatch"
+        );
     }
 
     function testConstructorRejectsZeroTokenAddress() public {
-        try new FairJackPool(address(0)) returns (FairJackPool) {
+        try
+            new FairJackPool(
+                address(0),
+                address(new MockVRFWrapper(address(token))),
+                0.001 ether
+            )
+        returns (FairJackPool) {
             revert("zero token constructor should revert");
         } catch (bytes memory result) {
-            require(_revertSelector(result) == FairJackPool.InvalidTokenAddress.selector, "wrong constructor error");
+            require(
+                _revertSelector(result) ==
+                    FairJackPool.InvalidTokenAddress.selector,
+                "wrong constructor error"
+            );
         }
     }
 
-    function _revertSelector(bytes memory revertData) private pure returns (bytes4 selector) {
+    function _revertSelector(
+        bytes memory revertData
+    ) private pure returns (bytes4 selector) {
         if (revertData.length < 4) return bytes4(0);
         assembly ("memory-safe") {
             selector := mload(add(revertData, 0x20))

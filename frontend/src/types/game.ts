@@ -1,10 +1,3 @@
-export type ValidatorRandomness = {
-  address: string;
-  commitment: string;
-  committed: boolean;
-  revealed: boolean;
-};
-
 export type GameData = {
   id: bigint;
   player: string;
@@ -13,37 +6,39 @@ export type GameData = {
   state: number;
   result: number;
   payout: bigint;
-  validators: ValidatorRandomness[];
   playerCards: bigint[];
   dealerCards: bigint[];
   playerScore: bigint;
   dealerScore: bigint;
-  playerCommit: string;
-  playerCommitted: boolean;
-  playerRevealed: boolean;
-  commitCount: number;
-  revealCount: number;
-  finalSeed: string;
-  commitDeadline: bigint;
-  revealDeadline: bigint;
   actionDeadline: bigint;
+  requestId: bigint;
+  phase: number;
+  requestCount: bigint;
+  fulfilled: boolean;
+  consumed: boolean;
+  queued: boolean;
+  oracleSpent: bigint;
+  oracleBudgetRemaining: bigint;
 };
-
 export const gameStateLabels = [
   "Creata",
-  "Attesa commit",
-  "Attesa reveal",
+  "Attesa oracolo",
+  "Carte pronte",
   "Turno player",
   "Turno dealer",
   "Conclusa",
-  "Annullata",
 ] as const;
-
-export const gameResultLabels = ["Nessuno", "Vittoria player", "Vittoria banco", "Push"] as const;
-
+export const gameResultLabels = [
+  "Nessuno",
+  "Vittoria player",
+  "Vittoria banco",
+  "Push",
+] as const;
+export const randomnessPhaseLabels = [
+  "Distribuzione iniziale",
+  "Hit del player",
+  "Pescata del dealer",
+] as const;
 export function activeDeadline(game: GameData) {
-  if (game.state === 1) return game.commitDeadline;
-  if (game.state === 2) return game.revealDeadline;
-  if (game.state === 3) return game.actionDeadline;
-  return 0n;
+  return game.state === 3 ? game.actionDeadline : 0n;
 }

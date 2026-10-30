@@ -5,9 +5,9 @@ import {
 } from "./helpers/deployFixture.js";
 import {
   reachPlayerTurn,
+  resolveStand,
   TEST_BET,
   TEST_POOL_DEPOSIT,
-  TEST_VALIDATOR_COLLATERAL,
 } from "./helpers/gameHelpers.js";
 import {
   reachDealerWinTurn,
@@ -19,7 +19,7 @@ describe("FairJackPool payout accounting", function () {
   it("adds the bet to the pool when the player loses", async function () {
     const fixture = await networkHelpers.loadFixture(reachDealerWinTurn);
 
-    await fixture.pool.connect(fixture.player).stand(0n);
+    await resolveStand(fixture);
 
     expect(await fixture.pool.poolBalance()).to.equal(
       TEST_POOL_DEPOSIT + TEST_BET,
@@ -32,7 +32,7 @@ describe("FairJackPool payout accounting", function () {
   it("pays two times the bet and charges the net win to the pool", async function () {
     const fixture = await networkHelpers.loadFixture(reachPlayerWinTurn);
 
-    await fixture.pool.connect(fixture.player).stand(0n);
+    await resolveStand(fixture);
 
     expect((await fixture.pool.getGameResult(0n)).payout).to.equal(
       TEST_BET * 2n,
@@ -48,7 +48,7 @@ describe("FairJackPool payout accounting", function () {
   it("returns exactly the bet on push without changing pool value", async function () {
     const fixture = await networkHelpers.loadFixture(reachPushTurn);
 
-    await fixture.pool.connect(fixture.player).stand(0n);
+    await resolveStand(fixture);
 
     expect((await fixture.pool.getGameResult(0n)).payout).to.equal(TEST_BET);
     expect(await fixture.pool.poolBalance()).to.equal(TEST_POOL_DEPOSIT);
@@ -61,7 +61,7 @@ describe("FairJackPool payout accounting", function () {
     const fixture = await networkHelpers.loadFixture(reachPlayerTurn);
     expect(await fixture.pool.lockedLiquidity()).to.equal(TEST_BET * 2n);
 
-    await fixture.pool.connect(fixture.player).stand(0n);
+    await resolveStand(fixture);
 
     expect(await fixture.pool.lockedLiquidity()).to.equal(0n);
   });
@@ -86,10 +86,10 @@ describe("FairJackPool payout accounting", function () {
       reachPushTurn,
     ]) {
       const fixture = await networkHelpers.loadFixture(outcomeFixture);
-      await fixture.pool.connect(fixture.player).stand(0n);
+      await resolveStand(fixture);
 
       expect(await fixture.token.balanceOf(fixture.pool.target)).to.equal(
-        (await fixture.pool.poolBalance()) + TEST_VALIDATOR_COLLATERAL * 3n,
+        await fixture.pool.poolBalance(),
       );
     }
   });
@@ -101,7 +101,7 @@ describe("FairJackPool payout accounting", function () {
       fixture.staker.address,
     );
 
-    await fixture.pool.connect(fixture.player).stand(0n);
+    await resolveStand(fixture);
 
     expect(await fixture.pool.totalShares()).to.equal(totalSharesBefore);
     expect(await fixture.pool.sharesOf(fixture.staker.address)).to.equal(
@@ -113,7 +113,7 @@ describe("FairJackPool payout accounting", function () {
     const fixture = await networkHelpers.loadFixture(reachDealerWinTurn);
     const sharePriceBefore = await fixture.pool.getSharePrice();
 
-    await fixture.pool.connect(fixture.player).stand(0n);
+    await resolveStand(fixture);
 
     expect(await fixture.pool.getSharePrice()).to.be.greaterThan(
       sharePriceBefore,

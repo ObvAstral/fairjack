@@ -1,0 +1,137 @@
+\documentclass[10pt,a4paper]{article}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[margin=1.9cm]{geometry}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{3pt}
+\raggedbottom
+
+% Replace the names before submission.
+\newcommand{\ReportAuthors}{[Name Surname; Name Surname]}
+
+% Put the two images at these paths. Missing files leave visible placeholders,
+% so this source can still be compiled before the images are available.
+\newcommand{\reportfigure}[3]{%
+  \begin{center}
+    \IfFileExists{#1}{%
+      \includegraphics[width=0.96\linewidth,height=0.30\textheight,keepaspectratio]{#1}%
+    }{%
+      \fbox{\parbox[c][0.27\textheight][c]{0.92\linewidth}{%
+        \centering\small Add image file\\[5pt]\texttt{\detokenize{#1}}}}%
+    }\\[5pt]
+    \refstepcounter{figure}\label{#3}%
+    \begin{minipage}{0.96\linewidth}
+      \small\textbf{Figure \thefigure.} #2
+    \end{minipage}
+  \end{center}
+}
+
+\begin{document}
+\begin{center}
+  {\Large\bfseries FairJack: On-chain Blackjack with a Staked House Pool\par}
+  \vspace{3pt}
+  {\small INF0422 -- Blockchain, Distributed and Decentralised Systems\\
+  \ReportAuthors}
+\end{center}
+
+\section*{1. Aim and system model}
+FairJack is an educational decentralised blackjack prototype. A Solidity
+contract holds the game's authoritative state and ERC-20 tokens; a React
+interface connects players, liquidity providers and application-level
+validators through a wallet. The test token FJT is freely mintable, so it is
+used only to demonstrate the protocol, not to represent real value. The
+project combines an on-chain state machine, shared financial accounting and
+multi-party commit--reveal randomness.
+
+Liquidity providers deposit FJT into a house pool and receive shares. Their
+share price changes as the house wins or loses. A player stakes a bet
+$b\in[1,100]$ FJT, and the pool reserves $2b$ until the game ends. Thus an
+ongoing game cannot make its maximum payout unavailable through a withdrawal.
+Three registered validators, distinct from the player, are assigned to each
+game; each must have at least 100 FJT of collateral available per active
+game. Selection starts at an index derived from a hash of the player, game ID
+and contract address, then scans eligible validators. It is deterministic,
+not a source of unpredictable randomness.
+
+\section*{2. Game protocol}
+The player and each of the three validators first submit
+$H(s,\mathrm{gameId},\mathrm{sender},\mathrm{contract})$, where $s$ is a private
+32-byte secret and $H$ is Keccak-256. Binding the commitment to the game,
+account and contract prevents reuse in another context. All four commits
+must arrive within 15 minutes. A further 15-minute reveal phase opens only
+after the fourth commit. The contract checks every reveal against its
+commitment and, after all four reveals, hashes the secrets in a fixed order
+to form the final seed (Fig.~\ref{fig:protocol}).
+
+Cards are drawn from a 52-card deck by hashing the seed with a changing nonce;
+already drawn cards are rejected. Two cards go to the player and two to the
+dealer. The player may \texttt{hit} or \texttt{stand}; each valid hit renews a
+five-minute action deadline. A bust ends the game immediately. After a stand,
+the contract draws for the dealer until its score reaches at least 17, then
+settles by comparing scores. A win pays the player $2b$ in total, a push
+returns $b$, and a loss transfers the bet's economic value to the pool.
+
+\newpage
+\section*{3. Fairness mechanisms and failure handling}
+Commit--reveal prevents a participant from changing its secret after seeing
+other commitments. The pool's shares and reserved-liquidity check allocate
+ordinary wins and losses to the stakers while protecting active payouts.
+Anyone may call \texttt{claimTimeout} after a deadline: a validator that
+misses a commit or reveal loses 100 FJT collateral, credited to the pool;
+an otherwise compliant player gets the bet back and the game is cancelled.
+If the player misses its commit, reveal or action, the bet is forfeited.
+Cancellation and settlement release the game's liquidity reservation and
+validator capacity once. The contract uses OpenZeppelin's \texttt{SafeERC20}
+for token transfers and \texttt{ReentrancyGuard} on methods that transfer
+tokens or settle a game.
+
+\section*{4. Evaluation and limitations}
+The repository includes Hardhat tests for commitment validation, reveal
+ordering, card uniqueness, scoring, payout accounting, deadlines, slashing
+and a complete game. These tests specify intended behaviours; this report
+does not claim an independent security audit or a deployed Sepolia instance.
+The web interface exposes pool operations, validator management and the game
+flow (Fig.~\ref{fig:interface}). The source contains a local deployment script and instructions in
+\texttt{README.md}; the same script has a Sepolia configuration.
+
+There are important fairness limits. A participant who reveals last can
+choose to abort after seeing the other secrets; slashing makes this costly
+but does not remove the option. Once the seed is published, the remaining
+deck can be computed, so a player can choose hits with knowledge unavailable
+in physical blackjack. The dealer's initial cards are also recorded in
+public state. Validator selection is predictable and identities are not
+Sybil-resistant. The FJT token and fixed 18-decimal bet constants further
+limit the design to a controlled demonstration. These points prevent a claim
+that the current game is secure for real-money use.
+
+\section*{5. Reproduction and AI declaration}
+The project archive should include the source and \texttt{README.md}, which
+gives the local setup, deployment and browser walkthrough. In brief, install
+the root and frontend dependencies, start the Hardhat node, run
+\texttt{npm run deploy:local}, then \texttt{npm run frontend}; the README lists
+the required test accounts and wallet network. AI tools supported the
+testing work throughout the project, including security-oriented cases and
+checks of code usability, and suggested refactorings where clearer
+implementations were possible. OpenAI Codex was also used to analyse the
+repository and draft this report.
+
+{\footnotesize
+\textbf{References.} [1] FairJack source: \texttt{contracts/FairJackPool.sol},
+\texttt{contracts/MockERC20.sol}, \texttt{test/}, and \texttt{README.md}
+(submitted version). [2] OpenZeppelin Contracts, ERC-20, SafeERC20 and
+ReentrancyGuard (dependencies used by the source).
+}
+
+\newpage
+\section*{Figures}
+\reportfigure{figures/protocol-flow.png}{FairJack game lifecycle: commitments,
+reveals, card dealing, player decisions and final settlement.}{fig:protocol}
+
+\vfill
+
+\reportfigure{figures/fairjack-interface.png}{FairJack web interface showing
+game progress alongside pool or validator status.}{fig:interface}
+
+\end{document}

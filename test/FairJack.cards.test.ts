@@ -7,8 +7,12 @@ describe("FairJackPool deterministic card drawing", function () {
   async function deployCardFixture() {
     const [player] = await ethers.getSigners();
     const token = await ethers.deployContract("MockERC20");
+    const oracle = await ethers.deployContract("MockVRFWrapper", [
+      token.target,
+    ]);
     const pool = await ethers.deployContract("CardDrawingHarness", [
       token.target,
+      oracle.target,
     ]);
     const seed = ethers.keccak256(ethers.toUtf8Bytes("fairjack test seed"));
 
@@ -18,8 +22,7 @@ describe("FairJackPool deterministic card drawing", function () {
   }
 
   it("derives a card from keccak256(abi.encode(seed, nonce))", async function () {
-    const { pool, seed } =
-      await networkHelpers.loadFixture(deployCardFixture);
+    const { pool, seed } = await networkHelpers.loadFixture(deployCardFixture);
     const encoded = ethers.AbiCoder.defaultAbiCoder().encode(
       ["bytes32", "uint256"],
       [seed, 0n],
@@ -32,8 +35,7 @@ describe("FairJackPool deterministic card drawing", function () {
   });
 
   it("produces the same sequence from the same seed", async function () {
-    const { pool, seed } =
-      await networkHelpers.loadFixture(deployCardFixture);
+    const { pool, seed } = await networkHelpers.loadFixture(deployCardFixture);
     await pool.createCardTestGame(seed);
 
     await pool.drawCardsForTest(0n, 20n, true);
@@ -71,12 +73,12 @@ describe("FairJackPool deterministic card drawing", function () {
     }
   });
 
-  it("increments the nonce while retrying collisions", async function () {
+  it("draws exactly 52 cards with bounded work", async function () {
     const { pool } = await networkHelpers.loadFixture(deployCardFixture);
 
     await pool.drawCardsForTest(0n, 52n, true);
 
-    expect(await pool.getCardNonce(0n)).to.be.greaterThan(52n);
+    expect(await pool.getCardsDrawn(0n)).to.equal(52n);
   });
 
   it("rejects drawing after all 52 cards are used", async function () {
@@ -88,12 +90,11 @@ describe("FairJackPool deterministic card drawing", function () {
     ).to.be.revertedWithCustomError(pool, "DeckExhausted");
   });
 
-  it("rejects drawing before a final seed exists", async function () {
+  it("accepts a zero seed as valid randomness", async function () {
     const { pool } = await networkHelpers.loadFixture(deployCardFixture);
     await pool.createCardTestGame(ethers.ZeroHash);
 
-    await expect(
-      pool.drawCardsForTest(1n, 1n, true),
-    ).to.be.revertedWithCustomError(pool, "RandomnessNotReady");
+    await pool.drawCardsForTest(1n, 1n, true);
+    expect(await pool.getPlayerCards(1n)).to.have.length(1);
   });
 });

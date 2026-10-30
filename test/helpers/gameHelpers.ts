@@ -1,114 +1,114 @@
-import { createCommit, createSecret } from "./cryptoHelpers.js";
-import { deployFixture, ethers } from "./deployFixture.js";
+import { deployFixture, ORACLE_FUNDING, ethers } from "./deployFixture.js";
 
 export const TEST_POOL_DEPOSIT = ethers.parseEther("1000");
-export const TEST_VALIDATOR_COLLATERAL = ethers.parseEther("200");
 export const TEST_BET = ethers.parseEther("25");
+export type GameFixture = Awaited<ReturnType<typeof deployFixture>>;
 
 export async function createPool() {
-  const fixture = await deployFixture();
-  await fixture.pool
-    .connect(fixture.staker)
-    .depositToHousePool(TEST_POOL_DEPOSIT);
-  return fixture;
+  const f = await deployFixture();
+  await f.pool.connect(f.staker).depositToHousePool(TEST_POOL_DEPOSIT);
+  await f.pool.connect(f.staker).fundOracle({ value: ORACLE_FUNDING });
+  return f;
 }
-
-export async function registerThreeValidators() {
-  const fixture = await createPool();
-  for (const validator of [
-    fixture.validatorA,
-    fixture.validatorB,
-    fixture.validatorC,
-  ]) {
-    await fixture.pool
-      .connect(validator)
-      .registerAsValidator(TEST_VALIDATOR_COLLATERAL);
-  }
-  return fixture;
-}
-
 export async function createGame() {
-  const fixture = await registerThreeValidators();
-  await fixture.pool.connect(fixture.player).startPoolGame(TEST_BET);
+  const f = await createPool();
+  await f.pool.connect(f.player).startPoolGame(TEST_BET);
+  return f;
+}
+export function scoreHand(cards: readonly bigint[]): number {
+  let score = 0,
+    aces = 0;
+  for (const card of cards) {
+    const rank = Number(card) % 13;
+    if (rank === 0) {
+      score += 11;
+      ++aces;
+    } else score += Math.min(rank + 1, 10);
+  }
+  while (score > 21 && aces > 0) {
+    score -= 10;
+    --aces;
+  }
+  return score;
+}
 
-  const committee = await fixture.pool.getGameValidators(0n);
-  const signersByAddress = new Map(
-    fixture.accounts.map((account) => [
-      account.address.toLowerCase(),
-      account,
-    ]),
+// Independent full-array shuffle model (production uses sparse encoded slots).
+export function drawPhase(
+  f: GameFixture,
+  gameId: bigint,
+  requestId: bigint,
+  word: bigint,
+  seen: readonly bigint[],
+  count: number,
+): bigint[] {
+  const deck = Array.from({ length: 52 }, (_, i) => BigInt(i));
+  for (const card of seen) {
+    const index = deck.indexOf(card);
+    if (index < 0) throw new Error("Duplicate prior card");
+    deck[index] = deck[deck.length - 1];
+    deck.pop();
+  }
+  const coder = ethers.AbiCoder.defaultAbiCoder();
+  const seed = ethers.keccak256(
+    coder.encode(
+      ["uint256", "address", "uint256", "uint256", "uint256"],
+      [f.chainId, f.pool.target, gameId, requestId, word],
+    ),
   );
-  const committeeSigners = committee.map((address) => {
-    const signer = signersByAddress.get(address.toLowerCase());
-    if (signer === undefined) {
-      throw new Error(`Missing signer for committee member ${address}`);
-    }
-    return signer;
-  });
-
-  return { ...fixture, committee, committeeSigners };
-}
-
-export async function submitAllCommits() {
-  const fixture = await createGame();
-  const contractAddress = await fixture.pool.getAddress();
-  const playerSecret = createSecret();
-  const validatorSecrets: [string, string, string] = [
-    createSecret(),
-    createSecret(),
-    createSecret(),
-  ];
-
-  await fixture.pool
-    .connect(fixture.player)
-    .submitPlayerCommit(
-      0n,
-      createCommit(
-        playerSecret,
-        0n,
-        fixture.player.address,
-        contractAddress,
-      ),
+  const result: bigint[] = [];
+  for (let nonce = 0; nonce < count; ++nonce) {
+    const hash = ethers.keccak256(
+      coder.encode(["bytes32", "uint256"], [seed, nonce]),
     );
-
-  for (let index = 0; index < fixture.committeeSigners.length; ++index) {
-    const validator = fixture.committeeSigners[index];
-    await fixture.pool
-      .connect(validator)
-      .submitValidatorCommit(
-        0n,
-        createCommit(
-          validatorSecrets[index],
-          0n,
-          validator.address,
-          contractAddress,
-        ),
-      );
+    const index = Number(BigInt(hash) % BigInt(deck.length));
+    result.push(deck[index]);
+    deck[index] = deck[deck.length - 1];
+    deck.pop();
   }
-
-  return { ...fixture, playerSecret, validatorSecrets };
+  return result;
 }
-
-export async function submitAllReveals() {
-  const fixture = await submitAllCommits();
-  await fixture.pool
-    .connect(fixture.player)
-    .revealPlayerSecret(0n, fixture.playerSecret);
-
-  let lastRevealTransaction;
-  for (let index = 0; index < fixture.committeeSigners.length; ++index) {
-    lastRevealTransaction = await fixture.pool
-      .connect(fixture.committeeSigners[index])
-      .revealValidatorSecret(0n, fixture.validatorSecrets[index]);
+export function findWord(
+  f: GameFixture,
+  gameId: bigint,
+  requestId: bigint,
+  seen: readonly bigint[],
+  count: number,
+  predicate: (cards: bigint[]) => boolean,
+) {
+  for (let word = 0n; word < 20000n; ++word) {
+    const cards = drawPhase(f, gameId, requestId, word, seen, count);
+    if (predicate(cards)) return { word, cards };
   }
-
-  if (lastRevealTransaction === undefined) {
-    throw new Error("The validator committee is empty");
-  }
-
-  return { ...fixture, lastRevealTransaction };
+  throw new Error("No test oracle word satisfies predicate");
 }
-
+export async function fulfillAndProcess(
+  f: GameFixture,
+  gameId = 0n,
+  word = 1n,
+) {
+  const progress = await f.pool.getGameRandomness(gameId);
+  const fulfillment = await f.oracle.fulfillRandomWords(
+    progress.requestId,
+    word,
+  );
+  const processing = await f.pool.connect(f.outsider).processRandomness(gameId);
+  return { fulfillment, processing };
+}
+export async function prepareTurn(predicate: (cards: bigint[]) => boolean) {
+  const f = await createGame();
+  const { requestId } = await f.pool.getGameRandomness(0n);
+  const { word, cards } = findWord(f, 0n, requestId, [], 4, predicate);
+  await fulfillAndProcess(f, 0n, word);
+  return { ...f, initialWord: word, initialCards: cards };
+}
 export async function reachPlayerTurn() {
-  return submitAllReveals();
+  return prepareTurn(
+    (cards) =>
+      scoreHand(cards.slice(0, 2)) === 16 && scoreHand(cards.slice(2)) < 17,
+  );
+}
+export async function resolveStand(f: GameFixture, gameId = 0n, word = 7n) {
+  await f.pool.connect(f.player).stand(gameId);
+  if ((await f.pool.getGameCore(gameId)).state === 1n)
+    await fulfillAndProcess(f, gameId, word);
 }

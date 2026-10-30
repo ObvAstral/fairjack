@@ -1,17 +1,23 @@
-# FairJack frontend
+# Frontend FairJack VRF
 
-Console React/Vite per collaudare il protocollo FairJack su Hardhat Local o Sepolia. Espone tutte le operazioni utente del token e di `FairJackPool`, conserva i segreti commit/reveal nel `localStorage` separandoli per chain, contratto, partita e account e, solo sulla chain locale, permette di superare le deadline senza attendere 5/15 minuti.
-
-La configurazione viene generata automaticamente da `npm run deploy:local` o `npm run deploy:sepolia` nella root. Per una configurazione manuale, copia `.env.example` in `.env.local` e inserisci indirizzi del deploy e un RPC Sepolia browser-safe.
+React, Vite e TypeScript. Usa i contratti e il deploy descritti nel README della
+root. `npm run deploy:local` o `npm run deploy:sepolia` genera `.env.local`.
+I vecchi indirizzi del protocollo con validator sono **STORICI / OBSOLETI**:
+sono conservati soltanto [nell'archivio Sepolia](../docs/deployments/sepolia-legacy.md).
+Usa i valori del nuovo deploy VRF e verifica rete e versione nell'intestazione
+del file generato. `.env.example` è un modello, non un deploy già disponibile.
+Un deploy locale sovrascrive `.env.local`: conserva prima una copia della
+configurazione Sepolia e riavvia Vite quando cambi rete o indirizzi.
 
 ```bash
-npm install
+npm ci
 npm run dev
 ```
 
-Per typecheck e build:
+La UI include token, share FJT, riserva ETH dell'oracolo e tavolo asincrono.
+Le risposte vengono rilevate con polling; l'elaborazione è permissionless e
+richiede una transazione esplicita. Il pulsante di simulazione del mock e gli
+strumenti per avanzare il tempo sono presenti solo su chain ID 31337.
 
-```bash
-npm run build
-npm run lint
-```
+Dalla root, `npm run abi:sync` aggiorna le ABI dai contratti compilati.
+Per verificare il frontend: `npm run build` e `npm run lint`.

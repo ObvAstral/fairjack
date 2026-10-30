@@ -8,8 +8,12 @@ describe("FairJackPool house pool", function () {
   async function deployPoolFixture() {
     const [alice, bob] = await ethers.getSigners();
     const token = await ethers.deployContract("MockERC20");
+    const oracle = await ethers.deployContract("MockVRFWrapper", [
+      token.target,
+    ]);
     const pool = await ethers.deployContract("PoolAccountingHarness", [
       token.target,
+      oracle.target,
     ]);
 
     for (const account of [alice, bob]) {
@@ -68,9 +72,7 @@ describe("FairJackPool house pool", function () {
     await pool.recordPoolProfit(profit);
     await pool.connect(bob).depositToHousePool(bobDeposit);
 
-    expect(await pool.sharesOf(bob.address)).to.equal(
-      ethers.parseEther("100"),
-    );
+    expect(await pool.sharesOf(bob.address)).to.equal(ethers.parseEther("100"));
   });
 
   it("does not unfairly dilute existing stakers", async function () {
@@ -134,9 +136,7 @@ describe("FairJackPool house pool", function () {
 
   it("reports available liquidity as pool balance minus locks", async function () {
     const { pool, alice } = await networkHelpers.loadFixture(deployPoolFixture);
-    await pool
-      .connect(alice)
-      .depositToHousePool(ethers.parseEther("1000"));
+    await pool.connect(alice).depositToHousePool(ethers.parseEther("1000"));
     await pool.setLockedLiquidityForTest(ethers.parseEther("350"));
 
     expect(await pool.getAvailableLiquidity()).to.equal(

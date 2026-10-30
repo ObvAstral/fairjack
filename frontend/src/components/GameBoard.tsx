@@ -1,12 +1,15 @@
-import { Contract, JsonRpcProvider, ZeroHash } from "ethers";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { Contract, hexlify, JsonRpcProvider, randomBytes } from "ethers";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { contractConfig } from "../config/contracts";
-import { fairJackPoolAbi } from "../contracts/abis";
-import { activeDeadline, type GameData, type ValidatorRandomness } from "../types/game";
+import { fairJackPoolAbi, mockVrfWrapperAbi } from "../contracts/abis";
+import {
+  activeDeadline,
+  randomnessPhaseLabels,
+  type GameData,
+} from "../types/game";
 import type { PanelProps } from "../types/wallet";
 import { readableError } from "../utils/errors";
-import { cardLabel, shortAddress } from "../utils/format";
-import { createSecret, isValidSecret, loadSecret, saveSecret } from "../utils/secrets";
+import { cardLabel, formatToken } from "../utils/format";
 import ActionButtons from "./ActionButtons";
 import GameStatus from "./GameStatus";
 
@@ -14,20 +17,37 @@ type GameBoardProps = PanelProps & {
   selectedGameId: bigint;
   onSelectGame: (gameId: bigint) => void;
 };
-
-type ChainClock = { timestamp: number; loadedAt: number };
-
-function Hand({ title, cards, score }: { title: string; cards: bigint[]; score: bigint }) {
+type Action =
+  "hit" | "stand" | "timeout" | "process" | "request" | "fulfill" | "time";
+function Hand({
+  title,
+  cards,
+  score,
+}: {
+  title: string;
+  cards: bigint[];
+  score: bigint;
+}) {
   return (
     <div className="hand">
-      <div className="hand-heading"><span>{title}</span><strong>{cards.length ? score.toString() : "—"}</strong></div>
+      <div className="hand-heading">
+        <span>{title}</span>
+        <strong>{cards.length ? score.toString() : "—"}</strong>
+      </div>
       <div className="cards">
-        {cards.length === 0 && <span className="empty-hand">Carte non distribuite</span>}
+        {!cards.length && (
+          <span className="empty-hand">Carte non distribuite</span>
+        )}
         {cards.map((card, index) => {
           const display = cardLabel(card);
           return (
-            <div className={`playing-card ${display.red ? "red" : ""}`} key={`${card}-${index}`} title={`Carta #${card.toString()}`}>
-              <span>{display.label}</span><b>{display.suit}</b>
+            <div
+              className={`playing-card ${display.red ? "red" : ""}`}
+              key={`${card}-${index}`}
+              title={`Carta #${card}`}
+            >
+              <span>{display.label}</span>
+              <b>{display.suit}</b>
             </div>
           );
         })}
@@ -35,7 +55,6 @@ function Hand({ title, cards, score }: { title: string; cards: bigint[]; score: 
     </div>
   );
 }
-
 export default function GameBoard({
   provider,
   signer,
@@ -49,32 +68,43 @@ export default function GameBoard({
   const [gameIdInput, setGameIdInput] = useState(selectedGameId.toString());
   const [game, setGame] = useState<GameData | null>(null);
   const [nextGameId, setNextGameId] = useState(0n);
-  const [secret, setSecret] = useState("");
-  const [chainClock, setChainClock] = useState<ChainClock>({ timestamp: 0, loadedAt: 0 });
-  const [nowTick, setNowTick] = useState(0);
+  const [clock, setClock] = useState({ timestamp: 0, loadedAt: 0 });
+  const [now, setNow] = useState(Date.now);
   const [pending, setPending] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
-
+  const refreshVersion = useRef(0);
   const refresh = useCallback(async () => {
     if (!provider || !contractConfig.poolAddress) return;
+    const version = ++refreshVersion.current;
     try {
-      const pool = new Contract(contractConfig.poolAddress, fairJackPoolAbi, provider);
-      const gameCount = await pool.nextGameId() as bigint;
-      setNextGameId(gameCount);
-      if (selectedGameId >= gameCount) {
+      const pool = new Contract(
+        contractConfig.poolAddress,
+        fairJackPoolAbi,
+        provider,
+      );
+      const count = (await pool.nextGameId()) as bigint;
+      if (version !== refreshVersion.current) return;
+      setNextGameId(count);
+      if (selectedGameId >= count) {
         setGame(null);
-        setError(gameCount === 0n
-          ? "Non esistono ancora partite. Creane una dal pannello precedente."
-          : `Partita inesistente. Gli ID disponibili vanno da 0 a ${(gameCount - 1n).toString()}.`);
+        setError(count === 0n ? null : "Partita inesistente.");
         return;
       }
-
-      const [core, validators, deadlines, randomness, playerCards, dealerCards, playerScore, dealerScore, outcome, latestBlock] = await Promise.all([
+      const [
+        core,
+        randomness,
+        deadline,
+        playerCards,
+        dealerCards,
+        playerScore,
+        dealerScore,
+        outcome,
+        block,
+      ] = await Promise.all([
         pool.getGameCore(selectedGameId),
-        pool.getGameValidators(selectedGameId),
-        pool.getGameDeadlines(selectedGameId),
-        pool.getGameRandomnessProgress(selectedGameId),
+        pool.getGameRandomness(selectedGameId),
+        pool.getActionDeadline(selectedGameId),
         pool.getPlayerCards(selectedGameId),
         pool.getDealerCards(selectedGameId),
         pool.getPlayerScore(selectedGameId),
@@ -82,17 +112,7 @@ export default function GameBoard({
         pool.getGameResult(selectedGameId),
         provider.getBlock("latest"),
       ]);
-      const validatorStatuses: ValidatorRandomness[] = await Promise.all(
-        (validators as string[]).map(async (address) => {
-          const status = await pool.getValidatorRandomnessStatus(selectedGameId, address);
-          return {
-            address,
-            commitment: status.commitment,
-            committed: status.committed,
-            revealed: status.revealed,
-          };
-        }),
-      );
+      if (version !== refreshVersion.current) return;
       setGame({
         id: selectedGameId,
         player: core.player,
@@ -101,117 +121,123 @@ export default function GameBoard({
         state: Number(core.state),
         result: Number(outcome.result),
         payout: outcome.payout,
-        validators: validatorStatuses,
         playerCards: [...playerCards],
         dealerCards: [...dealerCards],
         playerScore,
         dealerScore,
-        playerCommit: randomness.playerCommit,
-        playerCommitted: randomness.playerCommitted,
-        playerRevealed: randomness.playerRevealed,
-        commitCount: Number(randomness.commitCount),
-        revealCount: Number(randomness.revealCount),
-        finalSeed: randomness.finalSeed,
-        commitDeadline: deadlines.commitDeadline,
-        revealDeadline: deadlines.revealDeadline,
-        actionDeadline: deadlines.actionDeadline,
+        actionDeadline: deadline,
+        requestId: randomness.requestId,
+        phase: Number(randomness.phase),
+        requestCount: randomness.requestCount,
+        fulfilled: randomness.fulfilled,
+        consumed: randomness.consumed,
+        queued: randomness.queued,
+        oracleSpent: randomness.oracleSpent,
+        oracleBudgetRemaining: randomness.oracleBudgetRemaining,
       });
-      if (latestBlock) setChainClock({ timestamp: latestBlock.timestamp, loadedAt: Date.now() });
+      if (block) setClock({ timestamp: block.timestamp, loadedAt: Date.now() });
       setError(null);
     } catch (cause) {
-      setGame(null);
-      setError(readableError(cause));
+      if (version === refreshVersion.current) {
+        setGame(null);
+        setError(readableError(cause));
+      }
     }
   }, [provider, selectedGameId]);
-
   useEffect(() => {
-    const timeout = window.setTimeout(() => setGameIdInput(selectedGameId.toString()), 0);
+    const timeout = window.setTimeout(
+      () => setGameIdInput(selectedGameId.toString()),
+      0,
+    );
     return () => window.clearTimeout(timeout);
   }, [selectedGameId]);
-
   useEffect(() => {
-    const timeout = window.setTimeout(() => { void refresh(); }, 0);
-    return () => window.clearTimeout(timeout);
-  }, [refresh, refreshNonce]);
-
-  useEffect(() => {
+    ++refreshVersion.current;
     const timeout = window.setTimeout(() => {
-      if (!account || !chainId || !contractConfig.poolAddress) {
-        setSecret("");
-        return;
-      }
-      setSecret(loadSecret(chainId, contractConfig.poolAddress, selectedGameId, account));
+      void refresh();
     }, 0);
-    return () => window.clearTimeout(timeout);
-  }, [account, chainId, selectedGameId]);
-
+    const poll = window.setInterval(() => {
+      void refresh();
+    }, 4000);
+    return () => {
+      window.clearTimeout(timeout);
+      window.clearInterval(poll);
+    };
+  }, [refresh, refreshNonce]);
   useEffect(() => {
-    const timer = window.setInterval(() => setNowTick(Date.now()), 1000);
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(timer);
   }, []);
-
-  const currentTimestamp = useMemo(
-    () => chainClock.timestamp + Math.floor((nowTick - chainClock.loadedAt) / 1000),
-    [chainClock, nowTick],
-  );
-
-  const normalizedAccount = account?.toLowerCase();
-  const validatorStatus = game?.validators.find((validator) => validator.address.toLowerCase() === normalizedAccount);
-  const role = game && normalizedAccount === game.player.toLowerCase()
-    ? "player"
-    : validatorStatus
-      ? "validator"
-      : "observer";
-  const committed = role === "player" ? Boolean(game?.playerCommitted) : Boolean(validatorStatus?.committed);
-  const revealed = role === "player" ? Boolean(game?.playerRevealed) : Boolean(validatorStatus?.revealed);
+  const timestamp =
+    clock.timestamp + Math.max(0, Math.floor((now - clock.loadedAt) / 1000));
+  const isPlayer = game?.player.toLowerCase() === account?.toLowerCase();
   const deadline = game ? activeDeadline(game) : 0n;
-
-  function storeSecret(value: string) {
-    setSecret(value);
-    if (isValidSecret(value) && account && chainId && contractConfig.poolAddress) {
-      saveSecret(chainId, contractConfig.poolAddress, selectedGameId, account, value);
-    }
-  }
-
   function chooseGame() {
     try {
-      const parsed = BigInt(gameIdInput);
-      if (parsed < 0n) throw new Error();
-      onSelectGame(parsed);
+      const id = BigInt(gameIdInput);
+      if (id < 0n) throw new Error();
+      onSelectGame(id);
+      setSuccess(null);
     } catch {
       setError("Inserisci un ID partita intero e non negativo.");
     }
   }
-
-  async function transact(action: "commit" | "reveal" | "hit" | "stand" | "timeout") {
-    if (!signer || !account || !game || !contractConfig.poolAddress) return;
+  async function transact(action: Action) {
+    if (!signer || !game || !contractConfig.poolAddress) return;
     try {
       setPending(action);
       setError(null);
       setSuccess(null);
-      const pool = new Contract(contractConfig.poolAddress, fairJackPoolAbi, signer);
-      let tx;
-      if (action === "commit") {
-        if (!isValidSecret(secret)) throw new Error("Il segreto deve essere un bytes32 (0x + 64 caratteri esadecimali).");
-        if (chainId) saveSecret(chainId, contractConfig.poolAddress, game.id, account, secret);
-        const commitment = await pool.computeCommitment(secret, game.id, account);
-        tx = role === "player"
-          ? await pool.submitPlayerCommit(game.id, commitment)
-          : await pool.submitValidatorCommit(game.id, commitment);
-      } else if (action === "reveal") {
-        if (!isValidSecret(secret)) throw new Error("Manca il segreto bytes32 usato per il commit.");
-        tx = role === "player"
-          ? await pool.revealPlayerSecret(game.id, secret)
-          : await pool.revealValidatorSecret(game.id, secret);
-      } else if (action === "hit") {
-        tx = await pool.hit(game.id);
-      } else if (action === "stand") {
-        tx = await pool.stand(game.id);
+      const pool = new Contract(
+        contractConfig.poolAddress,
+        fairJackPoolAbi,
+        signer,
+      );
+      if (action === "time") {
+        if (chainId !== 31337n || deadline === 0n)
+          throw new Error(
+            "Disponibile solo sulla rete locale durante il turno player.",
+          );
+        const rpc = new JsonRpcProvider(contractConfig.rpcUrl);
+        try {
+          const block = await rpc.getBlock("latest");
+          if (!block) throw new Error("Blocco locale non disponibile.");
+          if (BigInt(block.timestamp) <= deadline)
+            await rpc.send("evm_setNextBlockTimestamp", [
+              Number(deadline + 1n),
+            ]);
+          await rpc.send("evm_mine", []);
+        } finally {
+          rpc.destroy();
+        }
       } else {
-        tx = await pool.claimTimeout(game.id);
+        let tx;
+        if (action === "fulfill") {
+          if (chainId !== 31337n)
+            throw new Error("Il mock è disponibile solo sulla rete locale.");
+          const oracle = new Contract(
+            await pool.vrfWrapper(),
+            mockVrfWrapperAbi,
+            signer,
+          );
+          tx = await oracle.fulfillRandomWords(
+            game.requestId,
+            BigInt(hexlify(randomBytes(32))),
+          );
+        } else if (action === "process")
+          tx = await pool.processRandomness(game.id);
+        else if (action === "request")
+          tx = await pool.requestPendingRandomness(game.id);
+        else if (action === "timeout") tx = await pool.claimTimeout(game.id);
+        else if (action === "hit") tx = await pool.hit(game.id);
+        else tx = await pool.stand(game.id);
+        await tx.wait();
       }
-      await tx.wait();
-      setSuccess("Transazione confermata.");
+      setSuccess(
+        action === "hit" || action === "stand"
+          ? "Scelta registrata. Il tavolo si aggiorna automaticamente durante l’attesa."
+          : "Operazione confermata.",
+      );
       onTransactionConfirmed();
       await refresh();
     } catch (cause) {
@@ -220,110 +246,102 @@ export default function GameBoard({
       setPending(null);
     }
   }
-
-  async function advanceTime() {
-    if (!game || deadline === 0n) return;
-    try {
-      setPending("time");
-      setError(null);
-      setSuccess(null);
-      const localProvider = new JsonRpcProvider(contractConfig.rpcUrl);
-      const block = await localProvider.getBlock("latest");
-      if (!block) throw new Error("Impossibile leggere l'ultimo blocco locale.");
-      if (BigInt(block.timestamp) <= deadline) {
-        await localProvider.send("evm_setNextBlockTimestamp", [Number(deadline + 1n)]);
-      }
-      await localProvider.send("evm_mine", []);
-      localProvider.destroy();
-      setSuccess("La chain locale è ora oltre la deadline. Puoi reclamare il timeout.");
-      await refresh();
-    } catch (cause) {
-      setError(`Tool locale: ${readableError(cause)}`);
-    } finally {
-      setPending(null);
-    }
-  }
-
   return (
     <section className="game-section">
-      <div className="section-heading"><div><span className="step">05</span><h2>Tavolo e protocollo</h2></div><p>Commit/reveal, gioco, payout e timeout.</p></div>
-      <div className="game-picker">
-        <label>ID partita
-          <input value={gameIdInput} onChange={(event) => setGameIdInput(event.target.value)} inputMode="numeric" />
-        </label>
-        <button type="button" className="secondary" onClick={chooseGame}>Carica</button>
-        <button type="button" className="secondary" onClick={() => nextGameId > 0n && onSelectGame(nextGameId - 1n)} disabled={nextGameId === 0n}>Ultima</button>
-        <span>{nextGameId.toString()} partite totali</span>
+      <div className="section-heading">
+        <div>
+          <span className="step">05</span>
+          <h2>Tavolo</h2>
+        </div>
+        <p>Carte casuali verificate, oracolo pagato dalla pool.</p>
       </div>
-
+      <div className="form-grid single-row">
+        <label>
+          ID partita
+          <input
+            value={gameIdInput}
+            onChange={(event) => setGameIdInput(event.target.value)}
+            inputMode="numeric"
+          />
+        </label>
+        <button type="button" className="secondary" onClick={chooseGame}>
+          Apri partita
+        </button>
+      </div>
+      <p className="hint">
+        {nextGameId
+          ? `${nextGameId} partite create. ID da 0 a ${nextGameId - 1n}.`
+          : "Non esistono ancora partite. Creane una dal pannello precedente."}
+      </p>
       {game && (
         <>
-          <GameStatus game={game} currentTimestamp={currentTimestamp} />
-
+          <GameStatus game={game} currentTimestamp={timestamp} />
           <div className="table-surface">
-            <Hand title="Dealer" cards={game.dealerCards} score={game.dealerScore} />
-            <div className="table-mark"><span>FAIR</span><i>◆</i><span>JACK</span></div>
-            <Hand title="Player" cards={game.playerCards} score={game.playerScore} />
-          </div>
-
-          <div className="committee">
-            <h3>Partecipanti commit / reveal</h3>
-            <div className="participant-list">
-              <div className={role === "player" ? "current" : ""}>
-                <span>Player · {shortAddress(game.player)}</span>
-                <b className={game.playerCommitted ? "done" : ""}>{game.playerCommitted ? "Commit ✓" : "Commit —"}</b>
-                <b className={game.playerRevealed ? "done" : ""}>{game.playerRevealed ? "Reveal ✓" : "Reveal —"}</b>
-              </div>
-              {game.validators.map((validator, index) => (
-                <div className={validator.address.toLowerCase() === normalizedAccount ? "current" : ""} key={validator.address}>
-                  <span>V{index + 1} · {shortAddress(validator.address)}</span>
-                  <b className={validator.committed ? "done" : ""}>{validator.committed ? "Commit ✓" : "Commit —"}</b>
-                  <b className={validator.revealed ? "done" : ""}>{validator.revealed ? "Reveal ✓" : "Reveal —"}</b>
-                </div>
-              ))}
+            <Hand
+              title="Player"
+              cards={game.playerCards}
+              score={game.playerScore}
+            />
+            <div className="table-mark">
+              <i>FJ</i> BLACKJACK
             </div>
+            <Hand
+              title="Dealer"
+              cards={game.dealerCards}
+              score={game.dealerScore}
+            />
           </div>
-
-          {role !== "observer" && [1, 2].includes(game.state) && (
-            <div className="secret-panel">
-              <div>
-                <h3>Segreto locale · ruolo {role}</h3>
-                <p>È salvato solo in questo browser per chain, partita e account. Non perderlo prima del reveal.</p>
-              </div>
-              <label>bytes32
-                <input className="mono-input" value={secret} onChange={(event) => storeSecret(event.target.value.trim())} placeholder="0x…" spellCheck={false} />
-              </label>
-              <div className="actions">
-                <button type="button" className="secondary" onClick={() => storeSecret(createSecret())}>Genera nuovo</button>
-                <button type="button" className="secondary" onClick={() => void navigator.clipboard.writeText(secret)} disabled={!isValidSecret(secret)}>Copia</button>
-              </div>
-              {committed && !isValidSecret(secret) && <p className="error">Il commit esiste ma il segreto non è presente in questo browser/account. Incolla quello originale.</p>}
-            </div>
+          {game.state === 1 && (
+            <p className="hint">
+              {game.queued
+                ? "Servizio temporaneamente in attesa. La tua scelta è registrata e il tempo di gioco è sospeso. Chiunque può inviare la richiesta appena il servizio torna disponibile."
+                : "Attesa della risposta dell’oracolo. Il tempo di gioco è sospeso."}
+            </p>
           )}
-
-          {game.finalSeed !== ZeroHash && <p className="seed"><span>Final seed</span><code>{game.finalSeed}</code></p>}
-
+          {game.state === 2 && (
+            <p className="hint">
+              Le carte sono pronte. Chiunque può elaborarle; il turno del player
+              inizia dopo questa operazione.
+            </p>
+          )}
           <ActionButtons
-            role={role}
+            isPlayer={isPlayer}
             state={game.state}
-            committed={committed}
-            revealed={revealed}
-            secretValid={isValidSecret(secret)}
+            queued={game.queued}
             pending={pending}
+            expired={deadline > 0n && BigInt(timestamp) > deadline}
             localToolsEnabled={chainId === 31337n}
-            hasDeadline={deadline > 0n}
-            onCommit={() => void transact("commit")}
-            onReveal={() => void transact("reveal")}
-            onHit={() => void transact("hit")}
-            onStand={() => void transact("stand")}
-            onClaimTimeout={() => void transact("timeout")}
-            onAdvanceTime={() => void advanceTime()}
+            onAction={(action) => void transact(action)}
             onRefresh={() => void refresh()}
           />
-          <p className="role-note">Account corrente: <strong>{role}</strong>. Il claim timeout è intenzionalmente disponibile anche prima della scadenza per verificare il revert del contratto.</p>
+          <details className="oracle-details">
+            <summary>Verifica della partita</summary>
+            <dl className="stats">
+              <div>
+                <dt>Fase</dt>
+                <dd>{randomnessPhaseLabels[game.phase]}</dd>
+              </div>
+              <div>
+                <dt>Richieste</dt>
+                <dd>{game.requestCount.toString()}</dd>
+              </div>
+              <div>
+                <dt>Costo a carico della pool</dt>
+                <dd>{formatToken(game.oracleSpent, 18, 8)} ETH</dd>
+              </div>
+              <div>
+                <dt>Budget riservato residuo</dt>
+                <dd>{formatToken(game.oracleBudgetRemaining, 18, 8)} ETH</dd>
+              </div>
+            </dl>
+            {!game.queued && (
+              <p className="hint" style={{ overflowWrap: "anywhere" }}>
+                Request ID: {game.requestId.toString()}
+              </p>
+            )}
+          </details>
         </>
       )}
-
       {success && <p className="success">{success}</p>}
       {error && <p className="error">{error}</p>}
     </section>

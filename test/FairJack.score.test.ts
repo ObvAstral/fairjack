@@ -6,11 +6,15 @@ const { ethers, networkHelpers } = await network.create();
 describe("FairJackPool blackjack scoring", function () {
   async function deployScoringFixture() {
     const token = await ethers.deployContract("MockERC20");
-    const scoring = await ethers.deployContract("BlackjackScoringHarness", [
+    const oracle = await ethers.deployContract("MockVRFWrapper", [
       token.target,
     ]);
+    const scoring = await ethers.deployContract("BlackjackScoringHarness", [
+      token.target,
+      oracle.target,
+    ]);
 
-    return { token, scoring };
+    return { token, oracle, scoring };
   }
 
   const scoringCases = [
@@ -32,8 +36,7 @@ describe("FairJackPool blackjack scoring", function () {
   }
 
   it("treats every suit of the same rank equally", async function () {
-    const { scoring } =
-      await networkHelpers.loadFixture(deployScoringFixture);
+    const { scoring } = await networkHelpers.loadFixture(deployScoringFixture);
 
     expect(await scoring.scoreHandForTest([0, 8])).to.equal(20n);
     expect(await scoring.scoreHandForTest([13, 21])).to.equal(20n);
@@ -42,18 +45,20 @@ describe("FairJackPool blackjack scoring", function () {
   });
 
   it("rejects values outside the physical deck", async function () {
-    const { scoring } =
-      await networkHelpers.loadFixture(deployScoringFixture);
+    const { scoring } = await networkHelpers.loadFixture(deployScoringFixture);
 
-    await expect(
-      scoring.scoreHandForTest([52]),
-    ).to.be.revertedWithCustomError(scoring, "InvalidCard");
+    await expect(scoring.scoreHandForTest([52])).to.be.revertedWithCustomError(
+      scoring,
+      "InvalidCard",
+    );
   });
 
   it("scores a hand produced by deterministic card drawing", async function () {
-    const { token } = await networkHelpers.loadFixture(deployScoringFixture);
+    const { token, oracle } =
+      await networkHelpers.loadFixture(deployScoringFixture);
     const cards = await ethers.deployContract("CardDrawingHarness", [
       token.target,
+      oracle.target,
     ]);
     const seed = ethers.keccak256(ethers.toUtf8Bytes("integrated score seed"));
     await cards.createCardTestGame(seed);

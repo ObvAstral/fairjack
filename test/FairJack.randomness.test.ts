@@ -1,515 +1,183 @@
 import { expect } from "chai";
-import { network } from "hardhat";
 import {
-  createCommit,
-  createFinalSeed,
-  createSecret,
-} from "./helpers/cryptoHelpers.js";
+  ethers,
+  MAX_ORACLE_FEE,
+  networkHelpers,
+} from "./helpers/deployFixture.js";
+import {
+  createGame,
+  findWord,
+  fulfillAndProcess,
+  reachPlayerTurn,
+  TEST_BET,
+} from "./helpers/gameHelpers.js";
 
-const { ethers, networkHelpers } = await network.create();
-const INITIAL_BALANCE = ethers.parseEther("10000");
-const MIN_COLLATERAL = ethers.parseEther("100");
-const BET = ethers.parseEther("25");
-
-describe("FairJackPool randomness", function () {
-  async function deployGameFixture() {
-    const [staker, player, validatorA, validatorB, validatorC, outsider] =
-      await ethers.getSigners();
-    const token = await ethers.deployContract("MockERC20");
-    const pool = await ethers.deployContract("FairJackPool", [token.target]);
-    const accounts = [
-      staker,
-      player,
-      validatorA,
-      validatorB,
-      validatorC,
-      outsider,
-    ];
-
-    for (const account of accounts) {
-      await token.mint(account.address, INITIAL_BALANCE);
-      await token.connect(account).approve(pool.target, INITIAL_BALANCE);
-    }
-    await pool
-      .connect(staker)
-      .depositToHousePool(ethers.parseEther("1000"));
-    for (const validator of [validatorA, validatorB, validatorC]) {
-      await pool
-        .connect(validator)
-        .registerAsValidator(MIN_COLLATERAL * 2n);
-    }
-    await pool.connect(player).startPoolGame(BET);
-
-    const committee = await pool.getGameValidators(0n);
-    const signersByAddress = new Map(
-      accounts.map((account) => [account.address.toLowerCase(), account]),
+describe("FairJackPool asynchronous VRF", function () {
+  it("rejects forged callback senders", async function () {
+    const f = await networkHelpers.loadFixture(createGame);
+    await expect(
+      f.pool.connect(f.outsider).rawFulfillRandomWords(1n, [1n]),
+    ).to.be.revertedWithCustomError(f.pool, "OnlyVRFWrapperCanFulfill");
+  });
+  it("cannot act, process, or cancel before fulfillment", async function () {
+    const f = await createGame();
+    for (const action of [
+      f.pool.connect(f.player).hit(0n),
+      f.pool.connect(f.player).stand(0n),
+      f.pool.processRandomness(0n),
+    ])
+      await expect(action).to.be.revertedWithCustomError(
+        f.pool,
+        "InvalidGameState",
+      );
+    await expect(f.pool.claimTimeout(0n)).to.be.revertedWithCustomError(
+      f.pool,
+      "TimeoutUnavailable",
     );
-    const committeeSigners = committee.map((address) => {
-      const signer = signersByAddress.get(address.toLowerCase());
-      if (signer === undefined) {
-        throw new Error(`Missing signer for committee member ${address}`);
-      }
-      return signer;
+    await expect(
+      f.pool.requestPendingRandomness(0n),
+    ).to.be.revertedWithCustomError(f.pool, "NoQueuedRandomness");
+  });
+  it("keeps pending requests and ready results locked even after a long oracle delay", async function () {
+    const f = await createGame();
+    await networkHelpers.time.increase(30 * 86400);
+    await expect(f.pool.claimTimeout(0n)).to.be.revertedWithCustomError(
+      f.pool,
+      "TimeoutUnavailable",
+    );
+    await f.oracle.fulfillRandomWords(1n, 42n);
+    await networkHelpers.time.increase(86400);
+    await expect(f.pool.claimTimeout(0n)).to.be.revertedWithCustomError(
+      f.pool,
+      "TimeoutUnavailable",
+    );
+    await f.pool.processRandomness(0n);
+    const latest = await ethers.provider.getBlock("latest");
+    if (!latest) throw new Error("Missing latest block");
+    expect(await f.pool.getActionDeadline(0n)).to.equal(
+      BigInt(latest.timestamp) + 300n,
+    );
+  });
+  it("accepts a zero word and ignores unknown, malformed and duplicate responses", async function () {
+    const f = await createGame();
+    await f.oracle.deliverForTest(f.pool.target, 999n, [1n]);
+    await f.oracle.deliverForTest(f.pool.target, 1n, []);
+    await f.oracle.deliverForTest(f.pool.target, 1n, [1n, 2n]);
+    expect((await f.pool.getGameCore(0n)).state).to.equal(1n);
+    await f.oracle.fulfillRandomWords(1n, 0n);
+    await f.oracle.deliverForTest(f.pool.target, 1n, [999n]);
+    expect((await f.pool.randomnessRequests(1n)).randomWord).to.equal(0n);
+    await f.pool.processRandomness(0n);
+    const hand = await f.pool.getPlayerCards(0n);
+    await f.oracle.deliverForTest(f.pool.target, 1n, [99n]);
+    expect(await f.pool.getPlayerCards(0n)).to.deep.equal(hand);
+    await expect(f.pool.processRandomness(0n)).to.be.revertedWithCustomError(
+      f.pool,
+      "InvalidGameState",
+    );
+  });
+  it("matches out-of-order responses to the correct concurrent game, including game zero", async function () {
+    const f = await createGame();
+    await f.pool.connect(f.otherPlayer).startPoolGame(TEST_BET);
+    const a = await f.pool.getGameRandomness(0n),
+      b = await f.pool.getGameRandomness(1n);
+    await f.oracle.fulfillRandomWords(b.requestId, 777n);
+    expect((await f.pool.getGameCore(0n)).state).to.equal(1n);
+    expect((await f.pool.getGameCore(1n)).state).to.equal(2n);
+    await f.oracle.fulfillRandomWords(a.requestId, 777n);
+    await f.pool.processRandomness(1n);
+    await f.pool.processRandomness(0n);
+    expect(await f.pool.getPlayerCards(1n)).not.to.deep.equal(
+      await f.pool.getPlayerCards(0n),
+    );
+    expect((await f.pool.randomnessRequests(a.requestId)).gameId).to.equal(0n);
+    expect((await f.pool.randomnessRequests(b.requestId)).gameId).to.equal(1n);
+    const ga = await f.pool.getGameRandomness(0n),
+      gb = await f.pool.getGameRandomness(1n);
+    expect(await f.pool.lockedOracleBudget()).to.equal(
+      ga.oracleBudgetRemaining + gb.oracleBudgetRemaining,
+    );
+  });
+  it("requires a fresh request for each hit, blocks action changes and ignores stale responses", async function () {
+    const f = await networkHelpers.loadFixture(reachPlayerTurn);
+    const before = await f.pool.getGameRandomness(0n);
+    const oldHand = await f.pool.getPlayerCards(0n);
+    const reserve = await f.pool.getOracleReserve();
+    await f.pool.connect(f.player).hit(0n);
+    const after = await f.pool.getGameRandomness(0n);
+    expect(after.requestId).not.to.equal(before.requestId);
+    expect(after.phase).to.equal(1n);
+    expect(after.requestCount).to.equal(2n);
+    expect(await f.pool.getOracleReserve()).to.equal(
+      reserve - (await f.oracle.fee()),
+    );
+    expect(await f.pool.getPlayerCards(0n)).to.deep.equal(oldHand);
+    expect(await f.pool.getActionDeadline(0n)).to.equal(0n);
+    await expect(
+      f.pool.connect(f.player).stand(0n),
+    ).to.be.revertedWithCustomError(f.pool, "InvalidGameState");
+    await expect(
+      f.pool.connect(f.player).hit(0n),
+    ).to.be.revertedWithCustomError(f.pool, "InvalidGameState");
+    await f.oracle.deliverForTest(f.pool.target, before.requestId, [123n]);
+    expect((await f.pool.getGameCore(0n)).state).to.equal(1n);
+    await fulfillAndProcess(f, 0n, 0n);
+    expect(await f.pool.getPlayerCards(0n)).to.have.length(3);
+  });
+  for (const failure of ["fee", "outage"])
+    it(`queues a committed hit during ${failure}, without a player timeout or reroll`, async function () {
+      const f = await reachPlayerTurn();
+      const old = await f.pool.getGameRandomness(0n);
+      if (failure === "fee") await f.oracle.setFee(MAX_ORACLE_FEE + 1n);
+      else await f.oracle.setRequestsEnabled(false);
+      await expect(f.pool.connect(f.player).hit(0n))
+        .to.emit(f.pool, "OracleRequestDeferred")
+        .withArgs(0n, 1n);
+      const pending = await f.pool.getGameRandomness(0n);
+      expect(pending.queued).to.equal(true);
+      expect(pending.fulfilled).to.equal(false);
+      expect(pending.oracleSpent).to.equal(old.oracleSpent);
+      expect(pending.requestCount).to.equal(old.requestCount);
+      await networkHelpers.time.increase(1000);
+      await expect(f.pool.claimTimeout(0n)).to.be.revertedWithCustomError(
+        f.pool,
+        "TimeoutUnavailable",
+      );
+      await expect(
+        f.pool.requestPendingRandomness(0n),
+      ).to.be.revertedWithCustomError(f.pool, "OracleUnavailable");
+      await f.oracle.setFee(MAX_ORACLE_FEE);
+      await f.oracle.setRequestsEnabled(true);
+      await f.pool.connect(f.outsider).requestPendingRandomness(0n);
+      expect((await f.pool.getGameRandomness(0n)).queued).to.equal(false);
+      expect((await f.pool.getGameRandomness(0n)).requestCount).to.equal(
+        old.requestCount + 1n,
+      );
+      await expect(
+        f.pool.requestPendingRandomness(0n),
+      ).to.be.revertedWithCustomError(f.pool, "NoQueuedRandomness");
+      await fulfillAndProcess(f);
+      expect(await f.pool.getPlayerCards(0n)).to.have.length(3);
     });
-
-    return {
-      token,
-      pool,
-      player,
-      outsider,
-      committee,
-      committeeSigners,
-      signersByAddress,
-    };
-  }
-
-  type GameFixture = Awaited<ReturnType<typeof deployGameFixture>>;
-  type CommitteeSigners = GameFixture["committeeSigners"];
-
-  function createValidatorSecrets(): [string, string, string] {
-    return [createSecret(), createSecret(), createSecret()];
-  }
-
-  async function submitCommits(
-    fixture: GameFixture,
-    gameId: bigint,
-    playerSecret: string,
-    validatorSecrets: readonly [string, string, string],
-    committeeSigners: CommitteeSigners = fixture.committeeSigners,
-  ) {
-    const contractAddress = await fixture.pool.getAddress();
-    const playerCommit = createCommit(
-      playerSecret,
-      gameId,
-      fixture.player.address,
-      contractAddress,
-    );
-    const validatorCommits = committeeSigners.map((validator, index) =>
-      createCommit(
-        validatorSecrets[index],
-        gameId,
-        validator.address,
-        contractAddress,
-      ),
-    );
-
-    await fixture.pool
-      .connect(fixture.player)
-      .submitPlayerCommit(gameId, playerCommit);
-    for (let index = 0; index < committeeSigners.length; ++index) {
-      await fixture.pool
-        .connect(committeeSigners[index])
-        .submitValidatorCommit(gameId, validatorCommits[index]);
-    }
-
-    return { playerCommit, validatorCommits };
-  }
-
-  async function revealSecrets(
-    fixture: GameFixture,
-    gameId: bigint,
-    playerSecret: string,
-    validatorSecrets: readonly [string, string, string],
-    committeeSigners: CommitteeSigners = fixture.committeeSigners,
-    validatorOrder: readonly number[] = [0, 1, 2],
-    playerFirst = true,
-  ) {
-    if (playerFirst) {
-      await fixture.pool
-        .connect(fixture.player)
-        .revealPlayerSecret(gameId, playerSecret);
-    }
-    for (const index of validatorOrder) {
-      await fixture.pool
-        .connect(committeeSigners[index])
-        .revealValidatorSecret(gameId, validatorSecrets[index]);
-    }
-    if (!playerFirst) {
-      await fixture.pool
-        .connect(fixture.player)
-        .revealPlayerSecret(gameId, playerSecret);
-    }
-  }
-
-  async function prepareAllCommits() {
-    const fixture = await deployGameFixture();
-    const playerSecret = createSecret();
-    const validatorSecrets = createValidatorSecrets();
-    const { playerCommit, validatorCommits } = await submitCommits(
-      fixture,
-      0n,
-      playerSecret,
-      validatorSecrets,
-    );
-
-    return {
-      ...fixture,
-      playerSecret,
-      playerCommit,
-      validatorSecrets,
-      validatorCommits,
-    };
-  }
-
-  it("accepts the player commit after game creation", async function () {
-    const { pool, player } =
-      await networkHelpers.loadFixture(deployGameFixture);
-    const secret = createSecret();
-    const commitment = createCommit(
-      secret,
-      0n,
-      player.address,
-      await pool.getAddress(),
-    );
-
-    await expect(pool.connect(player).submitPlayerCommit(0n, commitment))
-      .to.emit(pool, "CommitSubmitted")
-      .withArgs(0n, player.address, true, commitment);
-
-    const progress = await pool.getGameRandomnessProgress(0n);
-    expect(progress.playerCommit).to.equal(commitment);
-    expect(progress.playerCommitted).to.equal(true);
-    expect(progress.commitCount).to.equal(1n);
-  });
-
-  it("uses exactly the same commitment encoding on-chain and off-chain", async function () {
-    const { pool, player } =
-      await networkHelpers.loadFixture(deployGameFixture);
-    const secret = createSecret();
-    const offChainCommit = createCommit(
-      secret,
-      0n,
-      player.address,
-      await pool.getAddress(),
-    );
-
-    expect(await pool.computeCommitment(secret, 0n, player.address)).to.equal(
-      offChainCommit,
-    );
-  });
-
-  it("accepts a commit from a selected validator", async function () {
-    const { pool, committeeSigners } =
-      await networkHelpers.loadFixture(deployGameFixture);
-    const validator = committeeSigners[0];
-    const commitment = createCommit(
-      createSecret(),
-      0n,
-      validator.address,
-      await pool.getAddress(),
-    );
-
-    await pool.connect(validator).submitValidatorCommit(0n, commitment);
-
-    const status = await pool.getValidatorRandomnessStatus(
-      0n,
-      validator.address,
-    );
-    expect(status.commitment).to.equal(commitment);
-    expect(status.committed).to.equal(true);
-  });
-
-  it("rejects a commit from a non-selected validator", async function () {
-    const { pool, outsider } =
-      await networkHelpers.loadFixture(deployGameFixture);
-
-    await expect(
-      pool
-        .connect(outsider)
-        .submitValidatorCommit(0n, ethers.keccak256(createSecret())),
-    ).to.be.revertedWithCustomError(pool, "NotSelectedValidator");
-  });
-
-  it("rejects duplicate commits", async function () {
-    const { pool, player, committeeSigners } =
-      await networkHelpers.loadFixture(deployGameFixture);
-    const playerCommit = createCommit(
-      createSecret(),
-      0n,
-      player.address,
-      await pool.getAddress(),
-    );
-    await pool.connect(player).submitPlayerCommit(0n, playerCommit);
-
-    await expect(
-      pool.connect(player).submitPlayerCommit(0n, playerCommit),
-    ).to.be.revertedWithCustomError(pool, "CommitAlreadySubmitted");
-
-    const validator = committeeSigners[0];
-    const validatorCommit = createCommit(
-      createSecret(),
-      0n,
-      validator.address,
-      await pool.getAddress(),
-    );
-    await pool.connect(validator).submitValidatorCommit(0n, validatorCommit);
-    await expect(
-      pool.connect(validator).submitValidatorCommit(0n, validatorCommit),
-    ).to.be.revertedWithCustomError(pool, "CommitAlreadySubmitted");
-  });
-
-  it("starts the reveal phase only after all four commits", async function () {
-    const prepared = await networkHelpers.loadFixture(prepareAllCommits);
-
-    expect((await prepared.pool.getGameCore(0n)).state).to.equal(2n);
-    expect(
-      (await prepared.pool.getGameDeadlines(0n)).revealDeadline,
-    ).to.be.greaterThan(0n);
-    expect(
-      (await prepared.pool.getGameRandomnessProgress(0n)).commitCount,
-    ).to.equal(4n);
-  });
-
-  it("rejects reveals before every participant has committed", async function () {
-    const { pool, player } =
-      await networkHelpers.loadFixture(deployGameFixture);
-    const secret = createSecret();
-    await pool
-      .connect(player)
-      .submitPlayerCommit(
+  it("allows multiple sequential hits only after consuming each fresh result", async function () {
+    const f = await reachPlayerTurn();
+    for (let i = 0; i < 2; ++i) {
+      const p = [...(await f.pool.getPlayerCards(0n))],
+        d = [...(await f.pool.getDealerCards(0n))];
+      const seen = [...p.slice(0, 2), ...d, ...p.slice(2)];
+      await f.pool.connect(f.player).hit(0n);
+      const { requestId } = await f.pool.getGameRandomness(0n);
+      const { word } = findWord(
+        f,
         0n,
-        createCommit(secret, 0n, player.address, await pool.getAddress()),
+        requestId,
+        seen,
+        1,
+        (cards) => Number(cards[0]) % 13 === 0,
       );
-
-    await expect(
-      pool.connect(player).revealPlayerSecret(0n, secret),
-    ).to.be.revertedWithCustomError(pool, "InvalidGameState");
-  });
-
-  it("accepts correct player and validator reveals", async function () {
-    const prepared = await networkHelpers.loadFixture(prepareAllCommits);
-
-    await expect(
-      prepared.pool
-        .connect(prepared.player)
-        .revealPlayerSecret(0n, prepared.playerSecret),
-    )
-      .to.emit(prepared.pool, "SecretRevealed")
-      .withArgs(0n, prepared.player.address, true);
-
-    for (let index = 0; index < prepared.committeeSigners.length; ++index) {
-      await prepared.pool
-        .connect(prepared.committeeSigners[index])
-        .revealValidatorSecret(0n, prepared.validatorSecrets[index]);
+      await fulfillAndProcess(f, 0n, word);
     }
-
-    const progress = await prepared.pool.getGameRandomnessProgress(0n);
-    expect(progress.playerRevealed).to.equal(true);
-    expect(progress.revealCount).to.equal(4n);
-    expect(await prepared.pool.lockedLiquidity()).to.equal(BET * 2n);
-    expect(await prepared.pool.poolBalance()).to.equal(
-      ethers.parseEther("1000"),
-    );
-    for (const validator of prepared.committee) {
-      expect((await prepared.pool.validators(validator)).activeGames).to.equal(
-        1n,
-      );
-    }
-  });
-
-  it("rejects an incorrect reveal", async function () {
-    const prepared = await networkHelpers.loadFixture(prepareAllCommits);
-
-    await expect(
-      prepared.pool
-        .connect(prepared.player)
-        .revealPlayerSecret(0n, createSecret()),
-    ).to.be.revertedWithCustomError(
-      prepared.pool,
-      "SecretDoesNotMatchCommit",
-    );
-  });
-
-  it("rejects reveals from the wrong address", async function () {
-    const prepared = await networkHelpers.loadFixture(prepareAllCommits);
-
-    await expect(
-      prepared.pool
-        .connect(prepared.outsider)
-        .revealPlayerSecret(0n, prepared.playerSecret),
-    ).to.be.revertedWithCustomError(prepared.pool, "NotGamePlayer");
-    await expect(
-      prepared.pool
-        .connect(prepared.outsider)
-        .revealValidatorSecret(0n, prepared.validatorSecrets[0]),
-    ).to.be.revertedWithCustomError(prepared.pool, "NotSelectedValidator");
-  });
-
-  it("rejects duplicate reveals", async function () {
-    const prepared = await networkHelpers.loadFixture(prepareAllCommits);
-    await prepared.pool
-      .connect(prepared.player)
-      .revealPlayerSecret(0n, prepared.playerSecret);
-
-    await expect(
-      prepared.pool
-        .connect(prepared.player)
-        .revealPlayerSecret(0n, prepared.playerSecret),
-    ).to.be.revertedWithCustomError(prepared.pool, "SecretAlreadyRevealed");
-  });
-
-  it("does not generate the seed before all four reveals", async function () {
-    const prepared = await networkHelpers.loadFixture(prepareAllCommits);
-    await prepared.pool
-      .connect(prepared.player)
-      .revealPlayerSecret(0n, prepared.playerSecret);
-    await prepared.pool
-      .connect(prepared.committeeSigners[0])
-      .revealValidatorSecret(0n, prepared.validatorSecrets[0]);
-    await prepared.pool
-      .connect(prepared.committeeSigners[1])
-      .revealValidatorSecret(0n, prepared.validatorSecrets[1]);
-
-    expect(
-      (await prepared.pool.getGameRandomnessProgress(0n)).finalSeed,
-    ).to.equal(ethers.ZeroHash);
-
-    await expect(
-      prepared.pool
-        .connect(prepared.committeeSigners[2])
-        .revealValidatorSecret(0n, prepared.validatorSecrets[2]),
-    ).to.emit(prepared.pool, "FinalSeedGenerated");
-  });
-
-  it("matches the deterministic final-seed formula", async function () {
-    const prepared = await networkHelpers.loadFixture(prepareAllCommits);
-    await revealSecrets(
-      prepared,
-      0n,
-      prepared.playerSecret,
-      prepared.validatorSecrets,
-    );
-
-    const expectedSeed = createFinalSeed(
-      0n,
-      prepared.playerSecret,
-      prepared.validatorSecrets,
-      await prepared.pool.getAddress(),
-    );
-    expect(
-      (await prepared.pool.getGameRandomnessProgress(0n)).finalSeed,
-    ).to.equal(expectedSeed);
-  });
-
-  it("cannot reuse a reveal commitment in another game", async function () {
-    const fixture = await networkHelpers.loadFixture(deployGameFixture);
-    await fixture.pool.connect(fixture.player).startPoolGame(BET);
-    const secondCommittee = await fixture.pool.getGameValidators(1n);
-    const secondCommitteeSigners = secondCommittee.map((address) => {
-      const signer = fixture.signersByAddress.get(address.toLowerCase());
-      if (signer === undefined) {
-        throw new Error(`Missing signer for committee member ${address}`);
-      }
-      return signer;
-    });
-    const playerSecret = createSecret();
-    const commitForGameZero = createCommit(
-      playerSecret,
-      0n,
-      fixture.player.address,
-      await fixture.pool.getAddress(),
-    );
-    await fixture.pool
-      .connect(fixture.player)
-      .submitPlayerCommit(1n, commitForGameZero);
-
-    const validatorSecrets = createValidatorSecrets();
-    for (let index = 0; index < secondCommitteeSigners.length; ++index) {
-      const validator = secondCommitteeSigners[index];
-      await fixture.pool
-        .connect(validator)
-        .submitValidatorCommit(
-          1n,
-          createCommit(
-            validatorSecrets[index],
-            1n,
-            validator.address,
-            await fixture.pool.getAddress(),
-          ),
-        );
-    }
-
-    await expect(
-      fixture.pool
-        .connect(fixture.player)
-        .revealPlayerSecret(1n, playerSecret),
-    ).to.be.revertedWithCustomError(
-      fixture.pool,
-      "SecretDoesNotMatchCommit",
-    );
-  });
-
-  it("produces the same seed from the same inputs", async function () {
-    const fixture = await networkHelpers.loadFixture(deployGameFixture);
-    const playerSecret = createSecret();
-    const validatorSecrets = createValidatorSecrets();
-    const snapshot = await networkHelpers.takeSnapshot();
-
-    await submitCommits(fixture, 0n, playerSecret, validatorSecrets);
-    await revealSecrets(fixture, 0n, playerSecret, validatorSecrets);
-    const firstSeed = (await fixture.pool.getGameRandomnessProgress(0n))
-      .finalSeed;
-
-    await snapshot.restore();
-    await submitCommits(fixture, 0n, playerSecret, validatorSecrets);
-    await revealSecrets(fixture, 0n, playerSecret, validatorSecrets);
-    const secondSeed = (await fixture.pool.getGameRandomnessProgress(0n))
-      .finalSeed;
-
-    expect(secondSeed).to.equal(firstSeed);
-  });
-
-  it("changes the seed when one secret changes", async function () {
-    const fixture = await networkHelpers.loadFixture(deployGameFixture);
-    const playerSecret = createSecret();
-    const originalSecrets = createValidatorSecrets();
-    const snapshot = await networkHelpers.takeSnapshot();
-
-    await submitCommits(fixture, 0n, playerSecret, originalSecrets);
-    await revealSecrets(fixture, 0n, playerSecret, originalSecrets);
-    const originalSeed = (await fixture.pool.getGameRandomnessProgress(0n))
-      .finalSeed;
-
-    await snapshot.restore();
-    const modifiedSecrets: [string, string, string] = [
-      createSecret(),
-      originalSecrets[1],
-      originalSecrets[2],
-    ];
-    await submitCommits(fixture, 0n, playerSecret, modifiedSecrets);
-    await revealSecrets(fixture, 0n, playerSecret, modifiedSecrets);
-    const modifiedSeed = (await fixture.pool.getGameRandomnessProgress(0n))
-      .finalSeed;
-
-    expect(modifiedSeed).not.to.equal(originalSeed);
-  });
-
-  it("keeps the seed identical when reveal transaction order changes", async function () {
-    const prepared = await networkHelpers.loadFixture(prepareAllCommits);
-    const snapshot = await networkHelpers.takeSnapshot();
-
-    await revealSecrets(
-      prepared,
-      0n,
-      prepared.playerSecret,
-      prepared.validatorSecrets,
-    );
-    const firstSeed = (await prepared.pool.getGameRandomnessProgress(0n))
-      .finalSeed;
-
-    await snapshot.restore();
-    await revealSecrets(
-      prepared,
-      0n,
-      prepared.playerSecret,
-      prepared.validatorSecrets,
-      prepared.committeeSigners,
-      [2, 0, 1],
-      false,
-    );
-    const reorderedSeed = (await prepared.pool.getGameRandomnessProgress(0n))
-      .finalSeed;
-
-    expect(reorderedSeed).to.equal(firstSeed);
+    expect(await f.pool.getPlayerCards(0n)).to.have.length(4);
+    expect((await f.pool.getGameRandomness(0n)).requestCount).to.equal(3n);
   });
 });

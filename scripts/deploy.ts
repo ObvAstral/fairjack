@@ -16,7 +16,7 @@ function getFrontendNetwork(): FrontendNetwork {
   if (networkName === "localhost") {
     return {
       name: "Hardhat Local",
-      rpcUrl: "http://127.0.0.1:8545",
+      rpcUrl: process.env.LOCAL_RPC_URL?.trim() || "http://127.0.0.1:8545",
       nativeCurrencyName: "Local Ether",
       nativeCurrencySymbol: "ETH",
     };
@@ -58,11 +58,65 @@ const token = await ethers.deployContract("MockERC20");
 await token.waitForDeployment();
 const tokenAddress = await token.getAddress();
 
-const pool = await ethers.deployContract("FairJackPool", [tokenAddress]);
+const local = networkName === "localhost";
+// Production/testnet always uses an existing Chainlink wrapper, never our mock.
+let wrapperAddress: string;
+if (local) {
+  const mock = await ethers.deployContract("MockVRFWrapper", [tokenAddress]);
+  await mock.waitForDeployment();
+  wrapperAddress = await mock.getAddress();
+} else {
+  wrapperAddress = ethers.getAddress(
+    process.env.VRF_WRAPPER_ADDRESS?.trim() ||
+      "0x195f15F2d49d693cE265b4fB0fdDbE15b1850Cc1",
+  );
+  if ((await ethers.provider.getCode(wrapperAddress)) === "0x") {
+    throw new Error(
+      "VRF_WRAPPER_ADDRESS non contiene un contratto sulla rete selezionata.",
+    );
+  }
+}
+const feeLimit = ethers.parseEther(
+  process.env.VRF_MAX_REQUEST_COST_ETH?.trim() || (local ? "0.001" : "0.005"),
+);
+if (feeLimit <= 0n)
+  throw new Error("VRF_MAX_REQUEST_COST_ETH deve essere positivo.");
+const initialReserve = ethers.parseEther(
+  process.env.ORACLE_RESERVE_ETH?.trim() || (local ? "0.5" : "0"),
+);
+if (initialReserve < 0n)
+  throw new Error("ORACLE_RESERVE_ETH non può essere negativo.");
+const pool = await ethers.deployContract("FairJackPool", [
+  tokenAddress,
+  wrapperAddress,
+  feeLimit,
+]);
 await pool.waitForDeployment();
 const poolAddress = await pool.getAddress();
+if (initialReserve > 0n) {
+  await (await pool.fundOracle({ value: initialReserve })).wait();
+}
+console.log(
+  `VRF wrapper${local ? " (MOCK locale)" : " Chainlink"}: ${wrapperAddress}`,
+);
+console.log(`Limite costo per richiesta: ${ethers.formatEther(feeLimit)} ETH`);
+console.log(
+  `Riserva ETH: ${ethers.formatEther(await pool.getOracleReserve())}`,
+);
+console.log(
+  `Budget per nuova partita: ${ethers.formatEther(
+    await pool.getRequiredOracleBudget(),
+  )} ETH`,
+);
 
 const envContents = [
+  "# GENERATO AUTOMATICAMENTE: configurazione di questo deploy.",
+  "# Protocollo: FairJack VRF (senza validator / commit-reveal).",
+  "# Oracolo: Chainlink VRF v2.5, direct funding pagato dalla pool.",
+  `# Rete: ${frontendNetwork.name}; chain ID: ${chainId.toString()}.`,
+  `# Generato il (UTC): ${new Date().toISOString()}`,
+  "# Deploy precedenti: docs/deployments/sepolia-legacy.md (OBSOLETI).",
+  "# Un altro deploy locale/Sepolia sovrascrive questo file: conserva le configurazioni da riutilizzare.",
   `VITE_TOKEN_ADDRESS=${tokenAddress}`,
   `VITE_POOL_ADDRESS=${poolAddress}`,
   `VITE_CHAIN_ID=${chainId.toString()}`,
@@ -74,7 +128,11 @@ const envContents = [
   "",
 ].join("\n");
 
-await writeFile(new URL("../frontend/.env.local", import.meta.url), envContents, "utf8");
+await writeFile(
+  new URL("../frontend/.env.local", import.meta.url),
+  envContents,
+  "utf8",
+);
 
 console.log(`MockERC20:    ${tokenAddress}`);
 console.log(`FairJackPool: ${poolAddress}`);

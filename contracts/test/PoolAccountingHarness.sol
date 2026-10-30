@@ -6,7 +6,10 @@ import {FairJackPool} from "../FairJackPool.sol";
 /// @dev Test-only harness used before gameplay exists to exercise pool profit
 ///      and locked-liquidity accounting in isolation.
 contract PoolAccountingHarness is FairJackPool {
-    constructor(address tokenAddress) FairJackPool(tokenAddress) {}
+    constructor(
+        address tokenAddress,
+        address wrapperAddress
+    ) FairJackPool(tokenAddress, wrapperAddress, 0.001 ether) {}
 
     function recordPoolProfit(uint256 amount) external {
         poolBalance += amount;

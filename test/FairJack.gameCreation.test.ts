@@ -1,177 +1,136 @@
 import { expect } from "chai";
-import { network } from "hardhat";
+import {
+  deployFixture,
+  ethers,
+  INITIAL_TOKEN_BALANCE,
+  MAX_ORACLE_FEE,
+  networkHelpers,
+  ORACLE_FUNDING,
+} from "./helpers/deployFixture.js";
+import {
+  createPool,
+  TEST_BET,
+  TEST_POOL_DEPOSIT,
+} from "./helpers/gameHelpers.js";
 
-const { ethers, networkHelpers } = await network.create();
-const MIN_COLLATERAL = ethers.parseEther("100");
-const INITIAL_BALANCE = ethers.parseEther("10000");
-const POOL_DEPOSIT = ethers.parseEther("1000");
-const BET = ethers.parseEther("25");
-
-describe("FairJackPool game creation", function () {
-  async function deployReadyPoolFixture() {
-    const [staker, player, validatorA, validatorB, validatorC] =
-      await ethers.getSigners();
-    const token = await ethers.deployContract("MockERC20");
-    const pool = await ethers.deployContract("FairJackPool", [token.target]);
-
-    for (const account of [
-      staker,
-      player,
-      validatorA,
-      validatorB,
-      validatorC,
-    ]) {
-      await token.mint(account.address, INITIAL_BALANCE);
-      await token.connect(account).approve(pool.target, INITIAL_BALANCE);
-    }
-
-    await pool.connect(staker).depositToHousePool(POOL_DEPOSIT);
-    for (const validator of [validatorA, validatorB, validatorC]) {
-      await pool.connect(validator).registerAsValidator(MIN_COLLATERAL);
-    }
-
-    return {
-      token,
+describe("FairJackPool game creation and oracle treasury", function () {
+  it("accepts native donations from anyone without minting token shares", async function () {
+    const { pool, outsider, token } =
+      await networkHelpers.loadFixture(deployFixture);
+    await expect(pool.connect(outsider).fundOracle({ value: 100n }))
+      .to.emit(pool, "OracleReserveFunded")
+      .withArgs(outsider.address, 100n);
+    await outsider.sendTransaction({ to: pool.target, value: 50n });
+    expect(await pool.getOracleReserve()).to.equal(150n);
+    expect(await pool.totalOracleFunded()).to.equal(150n);
+    expect(await pool.getAvailableOracleReserve()).to.equal(150n);
+    expect(await pool.totalShares()).to.equal(0n);
+    expect(await pool.poolBalance()).to.equal(0n);
+    expect(await token.balanceOf(pool.target)).to.equal(0n);
+    await expect(pool.fundOracle()).to.be.revertedWithCustomError(
       pool,
-      staker,
-      player,
-      validatorA,
-      validatorB,
-      validatorC,
-    };
-  }
-
-  it("creates a game separately from the player commit", async function () {
-    const { pool, player } =
-      await networkHelpers.loadFixture(deployReadyPoolFixture);
-
-    await expect(pool.connect(player).startPoolGame(BET))
-      .to.emit(pool, "PoolGameStarted")
-      .withArgs(0n, player.address, BET, BET * 2n);
-
-    const game = await pool.getGameCore(0n);
-    expect(game.player).to.equal(player.address);
-    expect(game.bet).to.equal(BET);
-    expect(game.maxPayout).to.equal(BET * 2n);
-    expect(game.state).to.equal(1n); // WaitingForCommits
-    expect(await pool.nextGameId()).to.equal(1n);
-  });
-
-  it("transfers the bet without treating it as pool profit", async function () {
-    const { token, pool, player } =
-      await networkHelpers.loadFixture(deployReadyPoolFixture);
-    const validatorCollateral = MIN_COLLATERAL * 3n;
-
-    await pool.connect(player).startPoolGame(BET);
-
-    expect(await token.balanceOf(player.address)).to.equal(
-      INITIAL_BALANCE - BET,
-    );
-    expect(await token.balanceOf(pool.target)).to.equal(
-      POOL_DEPOSIT + validatorCollateral + BET,
-    );
-    expect(await pool.poolBalance()).to.equal(POOL_DEPOSIT);
-    expect(await pool.totalShares()).to.equal(POOL_DEPOSIT);
-  });
-
-  it("locks exactly the maximum payout against pool liquidity", async function () {
-    const { pool, player } =
-      await networkHelpers.loadFixture(deployReadyPoolFixture);
-
-    await pool.connect(player).startPoolGame(BET);
-
-    expect(await pool.lockedLiquidity()).to.equal(BET * 2n);
-    expect(await pool.getAvailableLiquidity()).to.equal(
-      POOL_DEPOSIT - BET * 2n,
+      "ZeroAmount",
     );
   });
-
-  it("selects and reserves three distinct validators", async function () {
-    const { pool, player } =
-      await networkHelpers.loadFixture(deployReadyPoolFixture);
-
-    await pool.connect(player).startPoolGame(BET);
-    const committee = await pool.getGameValidators(0n);
-
-    expect(new Set(committee).size).to.equal(3);
-    expect(committee).not.to.include(player.address);
-    for (const validator of committee) {
-      const info = await pool.validators(validator);
-      expect(info.registered).to.equal(true);
-      expect(info.activeGames).to.equal(1n);
-    }
+  it("locks the payout and a complete native budget, paying VRF from the pool", async function () {
+    const f = await networkHelpers.loadFixture(createPool);
+    const fee = await f.oracle.fee();
+    const tx = await f.pool.connect(f.player).startPoolGame(TEST_BET);
+    await expect(tx)
+      .to.emit(f.pool, "PoolGameStarted")
+      .withArgs(0n, f.player.address, TEST_BET, TEST_BET * 2n);
+    await expect(tx).to.changeEtherBalances(
+      ethers,
+      [f.pool, f.oracle],
+      [-fee, fee],
+    );
+    const progress = await f.pool.getGameRandomness(0n);
+    const budget = await f.pool.getRequiredOracleBudget();
+    expect((await f.pool.getGameCore(0n)).state).to.equal(1n);
+    expect(progress.requestId).to.equal(1n);
+    expect(progress.phase).to.equal(0n);
+    expect(progress.requestCount).to.equal(1n);
+    expect(progress.oracleSpent).to.equal(fee);
+    expect(progress.oracleBudgetRemaining).to.equal(budget - fee);
+    expect(await f.pool.lockedOracleBudget()).to.equal(budget - fee);
+    expect(await f.pool.getAvailableOracleReserve()).to.equal(
+      ORACLE_FUNDING - budget,
+    );
+    expect(await f.pool.lockedLiquidity()).to.equal(TEST_BET * 2n);
+    expect(await f.pool.getActionDeadline(0n)).to.equal(0n);
+    expect(await f.pool.poolBalance()).to.equal(TEST_POOL_DEPOSIT);
+    expect(await f.token.balanceOf(f.player.address)).to.equal(
+      INITIAL_TOKEN_BALANCE - TEST_BET,
+    );
+    expect(await f.token.balanceOf(f.pool.target)).to.equal(
+      TEST_POOL_DEPOSIT + TEST_BET,
+    );
   });
-
-  it("initializes only the deadline for the current commit phase", async function () {
-    const { pool, player } =
-      await networkHelpers.loadFixture(deployReadyPoolFixture);
-    const before = BigInt(await networkHelpers.time.latest());
-
-    await pool.connect(player).startPoolGame(BET);
-
-    const deadlines = await pool.getGameDeadlines(0n);
-    expect(deadlines.commitDeadline).to.be.greaterThan(before);
-    expect(deadlines.revealDeadline).to.equal(0n);
-    expect(deadlines.actionDeadline).to.equal(0n);
-  });
-
-  it("rejects bets below the minimum", async function () {
-    const { pool, player } =
-      await networkHelpers.loadFixture(deployReadyPoolFixture);
-
+  it("does not accept an oracle fee attached by the player", async function () {
+    const f = await createPool();
     await expect(
-      pool.connect(player).startPoolGame(ethers.parseEther("1") - 1n),
-    ).to.be.revertedWithCustomError(pool, "BetBelowMinimum");
+      f.player.sendTransaction({
+        to: f.pool.target,
+        data: f.pool.interface.encodeFunctionData("startPoolGame", [TEST_BET]),
+        value: 1n,
+      }),
+    ).to.revert(ethers);
+    expect(await f.pool.nextGameId()).to.equal(0n);
   });
-
-  it("rejects bets above the maximum", async function () {
-    const { pool, player } =
-      await networkHelpers.loadFixture(deployReadyPoolFixture);
-
+  it("rejects bets outside the limits and missing allowance", async function () {
+    const f = await createPool();
     await expect(
-      pool.connect(player).startPoolGame(ethers.parseEther("100") + 1n),
-    ).to.be.revertedWithCustomError(pool, "BetAboveMaximum");
-  });
-
-  it("rejects a bet without sufficient allowance", async function () {
-    const { token, pool, player } =
-      await networkHelpers.loadFixture(deployReadyPoolFixture);
-    await token.connect(player).approve(pool.target, BET - 1n);
-
+      f.pool.connect(f.player).startPoolGame(0n),
+    ).to.be.revertedWithCustomError(f.pool, "BetBelowMinimum");
     await expect(
-      pool.connect(player).startPoolGame(BET),
-    ).to.be.revertedWithCustomError(pool, "InsufficientTokenAllowance");
-  });
-
-  it("reverts every accounting change if liquidity cannot cover max payout", async function () {
-    const { token, pool, staker, player } =
-      await networkHelpers.loadFixture(deployReadyPoolFixture);
-    await pool.connect(staker).withdrawFromHousePool(POOL_DEPOSIT);
-    const playerBalanceBefore = await token.balanceOf(player.address);
-    const contractBalanceBefore = await token.balanceOf(pool.target);
-
+      f.pool.connect(f.player).startPoolGame(ethers.parseEther("101")),
+    ).to.be.revertedWithCustomError(f.pool, "BetAboveMaximum");
+    await f.token.connect(f.player).approve(f.pool.target, 0n);
     await expect(
-      pool.connect(player).startPoolGame(BET),
-    ).to.be.revertedWithCustomError(pool, "InsufficientAvailableLiquidity");
-
-    expect(await token.balanceOf(player.address)).to.equal(playerBalanceBefore);
-    expect(await token.balanceOf(pool.target)).to.equal(contractBalanceBefore);
-    expect(await pool.lockedLiquidity()).to.equal(0n);
-    expect(await pool.nextGameId()).to.equal(0n);
+      f.pool.connect(f.player).startPoolGame(TEST_BET),
+    ).to.be.revertedWithCustomError(f.pool, "InsufficientTokenAllowance");
   });
-
-  it("reverts the bet and lock if a full eligible committee is unavailable", async function () {
-    const { token, pool, player, validatorA } =
-      await networkHelpers.loadFixture(deployReadyPoolFixture);
-    await pool.connect(validatorA).unregisterAsValidator();
-    const playerBalanceBefore = await token.balanceOf(player.address);
-
+  it("rolls back a start without payout liquidity or native reserve", async function () {
+    const f = await deployFixture();
     await expect(
-      pool.connect(player).startPoolGame(BET),
-    ).to.be.revertedWithCustomError(pool, "InsufficientEligibleValidators");
-
-    expect(await token.balanceOf(player.address)).to.equal(playerBalanceBefore);
-    expect(await pool.lockedLiquidity()).to.equal(0n);
-    expect(await pool.nextGameId()).to.equal(0n);
+      f.pool.connect(f.player).startPoolGame(TEST_BET),
+    ).to.be.revertedWithCustomError(f.pool, "InsufficientAvailableLiquidity");
+    await f.pool.connect(f.staker).depositToHousePool(TEST_POOL_DEPOSIT);
+    await expect(
+      f.pool.connect(f.player).startPoolGame(TEST_BET),
+    ).to.be.revertedWithCustomError(f.pool, "InsufficientOracleReserve");
+    expect(await f.pool.nextGameId()).to.equal(0n);
+    expect(await f.token.balanceOf(f.player.address)).to.equal(
+      INITIAL_TOKEN_BALANCE,
+    );
+    expect(await f.pool.lockedLiquidity()).to.equal(0n);
   });
+  it("cannot spend another active game's oracle reservation", async function () {
+    const f = await deployFixture();
+    await f.pool.connect(f.staker).depositToHousePool(TEST_POOL_DEPOSIT);
+    const budget = await f.pool.getRequiredOracleBudget();
+    await f.pool.fundOracle({ value: budget });
+    await f.pool.connect(f.player).startPoolGame(TEST_BET);
+    await expect(
+      f.pool.connect(f.otherPlayer).startPoolGame(TEST_BET),
+    ).to.be.revertedWithCustomError(f.pool, "InsufficientOracleReserve");
+    expect(await f.pool.nextGameId()).to.equal(1n);
+    expect(await f.pool.getAvailableOracleReserve()).to.equal(0n);
+  });
+  for (const failure of ["fee", "outage"])
+    it(`rolls back a new game during oracle ${failure}`, async function () {
+      const f = await createPool();
+      if (failure === "fee") await f.oracle.setFee(MAX_ORACLE_FEE + 1n);
+      else await f.oracle.setRequestsEnabled(false);
+      await expect(
+        f.pool.connect(f.player).startPoolGame(TEST_BET),
+      ).to.be.revertedWithCustomError(f.pool, "OracleUnavailable");
+      expect(await f.token.balanceOf(f.player.address)).to.equal(
+        INITIAL_TOKEN_BALANCE,
+      );
+      expect(await f.pool.getOracleReserve()).to.equal(ORACLE_FUNDING);
+      expect(await f.pool.lockedOracleBudget()).to.equal(0n);
+      expect(await f.pool.totalOracleSpent()).to.equal(0n);
+      expect(await f.pool.nextGameId()).to.equal(0n);
+    });
 });
