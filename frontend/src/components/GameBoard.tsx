@@ -8,6 +8,11 @@ import {
   type GameData,
 } from "../types/game";
 import type { PanelProps } from "../types/wallet";
+import {
+  chainTimestamp,
+  syncChainClock,
+  type ChainClock,
+} from "../utils/chainClock";
 import { readableError } from "../utils/errors";
 import { cardLabel, formatToken } from "../utils/format";
 import ActionButtons from "./ActionButtons";
@@ -68,8 +73,8 @@ export default function GameBoard({
   const [gameIdInput, setGameIdInput] = useState(selectedGameId.toString());
   const [game, setGame] = useState<GameData | null>(null);
   const [nextGameId, setNextGameId] = useState(0n);
-  const [clock, setClock] = useState({ timestamp: 0, loadedAt: 0 });
-  const [now, setNow] = useState(Date.now);
+  const [clock, setClock] = useState<ChainClock | null>(null);
+  const [now, setNow] = useState(() => performance.now());
   const [pending, setPending] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
@@ -135,7 +140,10 @@ export default function GameBoard({
         oracleSpent: randomness.oracleSpent,
         oracleBudgetRemaining: randomness.oracleBudgetRemaining,
       });
-      if (block) setClock({ timestamp: block.timestamp, loadedAt: Date.now() });
+      if (block) {
+        const loadedAt = performance.now();
+        setClock((previous) => syncChainClock(previous, block, loadedAt));
+      }
       setError(null);
     } catch (cause) {
       if (version === refreshVersion.current) {
@@ -165,11 +173,10 @@ export default function GameBoard({
     };
   }, [refresh, refreshNonce]);
   useEffect(() => {
-    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    const timer = window.setInterval(() => setNow(performance.now()), 1000);
     return () => window.clearInterval(timer);
   }, []);
-  const timestamp =
-    clock.timestamp + Math.max(0, Math.floor((now - clock.loadedAt) / 1000));
+  const timestamp = chainTimestamp(clock, now);
   const isPlayer = game?.player.toLowerCase() === account?.toLowerCase();
   const deadline = game ? activeDeadline(game) : 0n;
   function chooseGame() {
