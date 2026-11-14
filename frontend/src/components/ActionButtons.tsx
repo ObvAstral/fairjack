@@ -5,6 +5,8 @@ type ActionButtonsProps = {
   pending: string | null;
   expired: boolean;
   localToolsEnabled: boolean;
+  automatic: boolean;
+  sessionBlocked: boolean;
   onAction: (
     action:
       "hit" | "stand" | "timeout" | "process" | "request" | "fulfill" | "time",
@@ -18,6 +20,8 @@ export default function ActionButtons({
   pending,
   expired,
   localToolsEnabled,
+  automatic,
+  sessionBlocked,
   onAction,
   onRefresh,
 }: ActionButtonsProps) {
@@ -30,7 +34,7 @@ export default function ActionButtons({
             <button
               type="button"
               onClick={() => onAction("hit")}
-              disabled={busy || expired}
+              disabled={busy || expired || sessionBlocked}
             >
               {pending === "hit" ? "Hit…" : "Hit"}
             </button>
@@ -38,13 +42,13 @@ export default function ActionButtons({
               type="button"
               className="secondary"
               onClick={() => onAction("stand")}
-              disabled={busy || expired}
+              disabled={busy || expired || sessionBlocked}
             >
               {pending === "stand" ? "Stand…" : "Stand"}
             </button>
           </>
         )}
-        {state === 2 && (
+        {state === 2 && !automatic && (
           <button
             type="button"
             onClick={() => onAction("process")}
@@ -53,7 +57,7 @@ export default function ActionButtons({
             {pending === "process" ? "Elaborazione…" : "Elabora carte"}
           </button>
         )}
-        {state === 1 && queued && (
+        {state === 1 && queued && !automatic && (
           <button
             type="button"
             onClick={() => onAction("request")}
@@ -62,7 +66,7 @@ export default function ActionButtons({
             {pending === "request" ? "Invio…" : "Invia richiesta in attesa"}
           </button>
         )}
-        {state === 1 && !queued && localToolsEnabled && (
+        {state === 1 && !queued && localToolsEnabled && !automatic && (
           <button
             type="button"
             className="secondary"
@@ -74,7 +78,7 @@ export default function ActionButtons({
               : "Simula risposta (locale)"}
           </button>
         )}
-        {state === 3 && expired && (
+        {state === 3 && expired && !automatic && (
           <button
             type="button"
             className="danger"

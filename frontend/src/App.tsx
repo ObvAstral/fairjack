@@ -1,5 +1,5 @@
 import { BrowserProvider, Contract } from "ethers";
-import { useCallback, useEffect, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useState } from "react";
 import ConnectWallet from "./components/ConnectWallet";
 import GameBoard from "./components/GameBoard";
 import PoolPanel from "./components/PoolPanel";
@@ -10,7 +10,11 @@ import { fairJackPoolAbi } from "./contracts/abis";
 import { contractConfig } from "./config/contracts";
 import type { WalletState } from "./types/wallet";
 import { readableError } from "./utils/errors";
+import { createWalletSigner } from "./utils/walletSigner";
+import SessionPanel from "./components/SessionPanel";
 import "./App.css";
+
+const GameSessionProvider = lazy(() => import("./components/GameSessionProvider"));
 
 export default function App() {
   const [wallet, setWallet] = useState<WalletState>({
@@ -46,7 +50,7 @@ export default function App() {
         return;
       }
       const provider = new BrowserProvider(window.ethereum);
-      const signer = await provider.getSigner(accounts[0]);
+      const signer = await createWalletSigner(provider, accounts[0]);
       const network = await provider.getNetwork();
       setWallet({
         provider,
@@ -247,7 +251,9 @@ export default function App() {
       )}
 
       {appReady && (
-        <>
+        <Suspense fallback={<p className="hint">Caricamento delle sessioni…</p>}>
+        <GameSessionProvider key={`${wallet.chainId}:${wallet.account}`} wallet={wallet} onConfirmed={panelProps.onTransactionConfirmed}>
+          <SessionPanel />
           <div className="dashboard-grid">
             <TokenPanel {...panelProps} />
             <PoolPanel {...panelProps} />
@@ -282,11 +288,11 @@ export default function App() {
                 Finanzia la riserva ETH dell’oracolo: è un contributo separato
                 dalle share.
               </li>
-              <li>Crea una partita. La pool paga la distribuzione iniziale.</li>
+              <li>Apri una sessione e crea una partita. La pool paga VRF, il relayer paga il gas delle mosse.</li>
               <li>
                 {localNetwork
-                  ? "Usa “Simula risposta (locale)”, poi “Elabora carte”."
-                  : "Attendi Chainlink VRF, poi usa “Elabora carte”."}
+                  ? "Il dealer simula la risposta locale ed elabora le carte automaticamente."
+                  : "Attendi Chainlink VRF: il dealer elabora automaticamente le carte."}
               </li>
               <li>
                 Ogni Hit richiede una nuova risposta. Stand richiede randomness
@@ -301,7 +307,8 @@ export default function App() {
               </li>
             </ol>
           </details>
-        </>
+        </GameSessionProvider>
+        </Suspense>
       )}
     </main>
   );

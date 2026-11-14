@@ -4,6 +4,7 @@ import { fairJackPoolAbi, mockTokenAbi } from "../contracts/abis";
 import { contractConfig } from "../config/contracts";
 import type { PanelProps } from "../types/wallet";
 import { readableError } from "../utils/errors";
+import { useGameSession } from "../utils/useGameSession";
 
 type StartGameProps = PanelProps & {
   onGameStarted: (gameId: bigint) => void;
@@ -16,6 +17,7 @@ export default function StartGame({
   onTransactionConfirmed,
   onGameStarted,
 }: StartGameProps) {
+  const session = useGameSession();
   const [bet, setBet] = useState("25");
   const [decimals, setDecimals] = useState(18);
   const [minimum, setMinimum] = useState(0n);
@@ -72,6 +74,16 @@ export default function StartGame({
       setPending(true);
       setError(null);
       setSuccess(null);
+      if (!session.walletMode) {
+        const operation = await session.send(0, parseUnits(bet, decimals));
+        if (operation.gameId === undefined) throw new Error("Evento di creazione partita non trovato.");
+        const gameId = BigInt(operation.gameId);
+        setSuccess(`Partita #${gameId} creata. Il dealer segue le carte.`);
+        onGameStarted(gameId);
+        onTransactionConfirmed();
+        await refresh();
+        return;
+      }
       const pool = new Contract(
         contractConfig.poolAddress,
         fairJackPoolAbi,
@@ -139,15 +151,15 @@ export default function StartGame({
         <button
           type="button"
           onClick={() => void start()}
-          disabled={!signer || pending}
+          disabled={!signer || pending || session.busy || session.pending || (!session.walletMode && (!session.active || !session.available))}
         >
           {pending ? "Creazione…" : "Crea partita"}
         </button>
       </div>
       <p className="hint">
         Richiede allowance, liquidità pari a 2× la puntata e una riserva oracolo
-        sufficiente. Il costo VRF è a carico della pool; il wallet paga il
-        normale gas della transazione.
+        sufficiente. Il costo VRF è a carico della pool;{" "}
+        {session.walletMode ? "il gas della transazione è a tuo carico." : "il relayer paga il gas delle mosse della sessione."}
       </p>
       {success && <p className="success">{success}</p>}
       {error && <p className="error">{error}</p>}

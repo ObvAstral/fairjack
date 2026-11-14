@@ -1,6 +1,12 @@
 import { isError } from "ethers";
 
 const friendlyErrors: Record<string, string> = {
+  InvalidSession: "Sessione non valida o sostituita. Apri una nuova sessione.",
+  InvalidSessionSignature: "La firma della sessione o della mossa non è valida.",
+  InvalidSessionNonce: "Lo stato della sessione è cambiato. Verifica l’operazione in corso e aggiorna la pagina.",
+  SessionExpired: "La sessione o la mossa è scaduta. Rinnova la sessione per continuare.",
+  SessionBudgetExceeded: "La puntata supera il budget residuo o la puntata massima della sessione.",
+  InvalidSessionAction: "Questa operazione non è consentita dalla sessione di gioco.",
   InsufficientOracleReserve:
     "La riserva ETH libera della pool non copre il budget per una nuova partita.",
   OracleUnavailable:
@@ -37,19 +43,41 @@ function textProperty(value: unknown, property: string): string | null {
   return typeof candidate === "string" ? candidate : null;
 }
 
+function errorMessages(error: unknown, seen = new Set<unknown>()): string[] {
+  if (typeof error === "string") return [error];
+  if (typeof error !== "object" || error === null || seen.has(error)) return [];
+  seen.add(error);
+  const messages = ["shortMessage", "reason", "message"]
+    .map((property) => textProperty(error, property))
+    .filter((message): message is string => Boolean(message));
+  // Wallets and ethers wrap the RPC error in several different envelopes.
+  for (const property of ["error", "info", "data", "cause", "originalError"]) {
+    if (property in error)
+      messages.push(...errorMessages((error as Record<string, unknown>)[property], seen));
+  }
+  return messages;
+}
+
 export function readableError(error: unknown): string {
   if (isError(error, "ACTION_REJECTED"))
     return "Operazione rifiutata nel wallet.";
 
-  const possibleMessages = [
-    textProperty(error, "shortMessage"),
-    textProperty(error, "reason"),
-    error instanceof Error ? error.message : null,
-  ].filter((message): message is string => Boolean(message));
+  const possibleMessages = errorMessages(error);
+
+  const nonceMessage = possibleMessages.find((message) =>
+    /nonce too (high|low)|nonce has already been used/i.test(message),
+  );
+  if (nonceMessage || isError(error, "NONCE_EXPIRED")) {
+    const values = nonceMessage?.match(/expected nonce to be (\d+) but got (\d+)/i);
+    const detail = values
+      ? `Il wallet usa il nonce ${values[2]}, ma la rete attende ${values[1]}.`
+      : "Il nonce del wallet non è sincronizzato con la rete.";
+    return `${detail} Se hai riavviato Hardhat Local (31337), seleziona la rete locale e l’account di test nel wallet e cancella i dati di attività e nonce (MetaMask: Settings → Developer tools → Delete activity and nonce data; nelle versioni precedenti: Settings → Advanced → Clear activity and nonce data). Poi ricarica la pagina e riprova.`;
+  }
 
   for (const message of possibleMessages) {
     for (const [name, friendly] of Object.entries(friendlyErrors)) {
-      if (message.includes(name)) return friendly;
+      if (new RegExp(`\\b${name}\\b`).test(message)) return friendly;
     }
   }
 

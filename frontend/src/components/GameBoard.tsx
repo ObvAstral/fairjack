@@ -14,6 +14,7 @@ import {
   type ChainClock,
 } from "../utils/chainClock";
 import { readableError } from "../utils/errors";
+import { useGameSession } from "../utils/useGameSession";
 import { cardLabel, formatToken } from "../utils/format";
 import ActionButtons from "./ActionButtons";
 import GameStatus from "./GameStatus";
@@ -70,6 +71,7 @@ export default function GameBoard({
   selectedGameId,
   onSelectGame,
 }: GameBoardProps) {
+  const session = useGameSession();
   const [gameIdInput, setGameIdInput] = useState(selectedGameId.toString());
   const [game, setGame] = useState<GameData | null>(null);
   const [nextGameId, setNextGameId] = useState(0n);
@@ -195,6 +197,13 @@ export default function GameBoard({
       setPending(action);
       setError(null);
       setSuccess(null);
+      if ((action === "hit" || action === "stand") && !session.walletMode) {
+        await session.send(action === "hit" ? 1 : 2, game.id);
+        setSuccess("Scelta confermata. Il dealer segue la risposta dell’oracolo.");
+        onTransactionConfirmed();
+        await refresh();
+        return;
+      }
       const pool = new Contract(
         contractConfig.poolAddress,
         fairJackPoolAbi,
@@ -307,15 +316,18 @@ export default function GameBoard({
           )}
           {game.state === 2 && (
             <p className="hint">
-              Le carte sono pronte. Chiunque può elaborarle; il turno del player
-              inizia dopo questa operazione.
+              {session.dealer && !session.walletMode
+                ? "Le carte sono pronte. Il dealer sta elaborando la risposta; il turno inizia dopo la conferma."
+                : "Le carte sono pronte. Elabora la risposta dal wallet per iniziare il turno."}
             </p>
           )}
           <ActionButtons
             isPlayer={isPlayer}
             state={game.state}
             queued={game.queued}
-            pending={pending}
+            pending={pending || (session.busy || session.pending ? "session" : null)}
+            sessionBlocked={!session.walletMode && (!session.active || !session.available)}
+            automatic={session.dealer && !session.walletMode}
             expired={deadline > 0n && BigInt(timestamp) > deadline}
             localToolsEnabled={chainId === 31337n}
             onAction={(action) => void transact(action)}

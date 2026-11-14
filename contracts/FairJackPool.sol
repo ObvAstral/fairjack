@@ -7,12 +7,13 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/math/Math.sol";
 import {VRFV2PlusWrapperConsumerBase} from "@chainlink/contracts/src/v0.8/vrf/dev/VRFV2PlusWrapperConsumerBase.sol";
 import {VRFV2PlusClient} from "@chainlink/contracts/src/v0.8/vrf/dev/libraries/VRFV2PlusClient.sol";
+import {GameSessions} from "./GameSessions.sol";
 
 /// @notice ERC-20 blackjack bankroll with pool-funded Chainlink VRF v2.5.
 /// @dev Native ETH donations finance the oracle; they do not mint token shares
 ///      and are not redeemable. Fee-on-transfer/rebasing wager tokens are unsupported.
 ///      No owner, subscription manager, cancellation, or randomness re-roll exists.
-contract FairJackPool is ReentrancyGuard, VRFV2PlusWrapperConsumerBase {
+contract FairJackPool is ReentrancyGuard, VRFV2PlusWrapperConsumerBase, GameSessions {
     using SafeERC20 for IERC20;
 
     error InvalidTokenAddress();
@@ -239,9 +240,24 @@ contract FairJackPool is ReentrancyGuard, VRFV2PlusWrapperConsumerBase {
     function startPoolGame(
         uint256 bet
     ) external nonReentrant returns (uint256 gameId) {
+        return _startPoolGame(msg.sender, bet);
+    }
+
+    function executeSessionAction(SessionAction calldata action, bytes calldata signature) external nonReentrant {
+        address player = _authorizeSessionAction(action, signature);
+        if (action.kind == 0) _startPoolGame(player, action.argument);
+        else if (action.kind == 1) _hit(player, action.argument);
+        else _stand(player, action.argument);
+    }
+
+    function _validSessionBet(uint256 bet) internal pure override returns (bool) {
+        return bet >= MIN_BET && bet <= MAX_BET;
+    }
+
+    function _startPoolGame(address player, uint256 bet) private returns (uint256 gameId) {
         if (bet < MIN_BET) revert BetBelowMinimum(MIN_BET, bet);
         if (bet > MAX_BET) revert BetAboveMaximum(MAX_BET, bet);
-        uint256 allowance = token.allowance(msg.sender, address(this));
+        uint256 allowance = token.allowance(player, address(this));
         if (allowance < bet) revert InsufficientTokenAllowance(allowance, bet);
         uint256 maxPayout = bet * 2;
         uint256 available = getAvailableLiquidity();
@@ -253,33 +269,41 @@ contract FairJackPool is ReentrancyGuard, VRFV2PlusWrapperConsumerBase {
             revert InsufficientOracleReserve(oracleAvailable, budget);
 
         uint256 balanceBefore = token.balanceOf(address(this));
-        token.safeTransferFrom(msg.sender, address(this), bet);
+        token.safeTransferFrom(player, address(this), bet);
         uint256 received = token.balanceOf(address(this)) - balanceBefore;
         if (received != bet) revert UnsupportedTokenTransfer(bet, received);
 
         gameId = nextGameId++;
         Game storage game = games[gameId];
-        game.player = msg.sender;
+        game.player = player;
         game.bet = bet;
         game.maxPayout = maxPayout;
         game.oracleBudgetRemaining = budget;
         lockedLiquidity += maxPayout;
         lockedOracleBudget += budget;
-        emit PoolGameStarted(gameId, msg.sender, bet, maxPayout);
+        emit PoolGameStarted(gameId, player, bet, maxPayout);
         _requestRandomness(gameId, game, RandomnessPhase.InitialDeal);
     }
 
     function hit(uint256 gameId) external nonReentrant {
+        _hit(msg.sender, gameId);
+    }
+
+    function _hit(address player, uint256 gameId) private {
         Game storage game = _getGame(gameId);
-        _requirePlayerTurn(game);
+        _requirePlayerTurn(game, player);
         uint8[] memory hand = game.playerCards;
         if (_calculateHandScore(hand) > 21) revert PlayerAlreadyBust();
         _requestRandomness(gameId, game, RandomnessPhase.PlayerHit);
     }
 
     function stand(uint256 gameId) external nonReentrant {
+        _stand(msg.sender, gameId);
+    }
+
+    function _stand(address player, uint256 gameId) private {
         Game storage game = _getGame(gameId);
-        _requirePlayerTurn(game);
+        _requirePlayerTurn(game, player);
         uint8[] memory hand = game.playerCards;
         emit PlayerStand(gameId, _calculateHandScore(hand));
         uint8[] memory dealerHand = game.dealerCards;
@@ -745,9 +769,9 @@ contract FairJackPool is ReentrancyGuard, VRFV2PlusWrapperConsumerBase {
         }
     }
 
-    function _requirePlayerTurn(Game storage game) private view {
+    function _requirePlayerTurn(Game storage game, address player) private view {
         _requireState(game, GameState.PlayerTurn);
-        if (msg.sender != game.player) revert NotGamePlayer(msg.sender);
+        if (player != game.player) revert NotGamePlayer(player);
         if (block.timestamp > game.actionDeadline)
             revert GameDeadlinePassed(game.actionDeadline, block.timestamp);
     }

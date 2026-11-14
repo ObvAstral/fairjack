@@ -112,6 +112,7 @@ console.log(
 const envContents = [
   "# GENERATO AUTOMATICAMENTE: configurazione di questo deploy.",
   "# Protocollo: FairJack VRF (senza validator / commit-reveal).",
+  "# Sessioni: EIP-712 v2; relayer e dealer configurati in relayer/deployment.json.",
   "# Oracolo: Chainlink VRF v2.5, direct funding pagato dalla pool.",
   `# Rete: ${frontendNetwork.name}; chain ID: ${chainId.toString()}.`,
   `# Generato il (UTC): ${new Date().toISOString()}`,
@@ -138,3 +139,10 @@ console.log(`MockERC20:    ${tokenAddress}`);
 console.log(`FairJackPool: ${poolAddress}`);
 console.log(`Chain ID:     ${chainId.toString()}`);
 console.log("Configurazione scritta in frontend/.env.local");
+
+await writeFile(new URL("../relayer/deployment.json", import.meta.url), JSON.stringify({
+  chainId: chainId.toString(), pool: poolAddress, token: tokenAddress,
+  rpcUrl: frontendNetwork.rpcUrl, wrapper: wrapperAddress, mock: local,
+  deploymentId: await pool.sessionDeploymentId(),
+}, null, 2) + "\n", "utf8");
+console.log("Configurazione backend scritta in relayer/deployment.json");

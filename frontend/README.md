@@ -14,10 +14,19 @@ npm ci
 npm run dev
 ```
 
-La UI include token, share FJT, riserva ETH dell'oracolo e tavolo asincrono.
-Le risposte vengono rilevate con polling; l'elaborazione è permissionless e
-richiede una transazione esplicita. Il pulsante di simulazione del mock e gli
-strumenti per avanzare il tempo sono presenti solo su chain ID 31337.
+La UI include token, share FJT, riserva ETH, sessioni di gioco e tavolo asincrono.
+Avvia anche `npm run relayer:dev` dalla root: Vite inoltra `/api` al backend.
+La sessione dura al massimo 30 minuti e autorizza soltanto Start, Hit e Stand;
+la chiave temporanea resta in memoria. Approve iniziale e revoca passano dal
+wallet principale. Un refresh richiede una nuova sessione, mantenendo la
+possibilità di riprendere le mani già iniziate tramite il loro ID.
+
+Il **dealer** elabora automaticamente VRF e, solo localmente, può simulare il
+mock. La modalità wallet esplicita mantiene i pulsanti manuali e il gas a carico
+dell'utente. Usa “Verifica operazione” dopo una risposta di rete incerta.
+Il deploy deve esporre le API delle sessioni: la precedente versione VRF richiede
+un nuovo deploy. Per l'hosting, il backend può servire `frontend/dist` sulla
+stessa origine delle API; configurazione completa nel README della root.
 
 Dalla root, `npm run abi:sync` aggiorna le ABI dai contratti compilati.
 Per verificare il frontend: `npm run build` e `npm run lint`.
