@@ -1,9 +1,16 @@
 import { Contract, formatEther, parseEther } from "ethers";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useState } from "react";
 import { contractConfig } from "../config/contracts";
 import { fairJackPoolAbi } from "../contracts/abis";
 import type { PanelProps } from "../types/wallet";
-import { readableError } from "../utils/errors";
+import {
+  confirmTransaction,
+  readSnapshot,
+  type Confirmation,
+} from "../utils/async";
+import { useAsyncResource } from "../utils/useAsyncResource";
+import { useOperation } from "../utils/useOperation";
+import AsyncFeedback from "./AsyncFeedback";
 
 type ReserveData = {
   reserve: bigint;
@@ -18,94 +25,80 @@ export default function OraclePanel({
   provider,
   signer,
   refreshNonce,
+  confirmation,
   onTransactionConfirmed,
 }: PanelProps) {
-  const [data, setData] = useState<ReserveData | null>(null);
   const [amount, setAmount] = useState("0.1");
-  const [pending, setPending] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [success, setSuccess] = useState<string | null>(null);
-  const refresh = useCallback(async () => {
-    if (!provider || !contractConfig.poolAddress) return;
-    try {
+  const operation = useOperation();
+  const load = useCallback(
+    (signal: AbortSignal, confirmed?: Confirmation, minimumBlock?: number) =>
+      readSnapshot(
+        provider!,
+        signal,
+        confirmed,
+        async (blockTag): Promise<ReserveData> => {
+          const pool = new Contract(
+            contractConfig.poolAddress!,
+            fairJackPoolAbi,
+            provider!
+          );
+          const [reserve, locked, available, spent, required, cap, feeData] =
+            await Promise.all([
+              pool.getOracleReserve({ blockTag }),
+              pool.lockedOracleBudget({ blockTag }),
+              pool.getAvailableOracleReserve({ blockTag }),
+              pool.totalOracleSpent({ blockTag }),
+              pool.getRequiredOracleBudget({ blockTag }),
+              pool.maxOracleRequestCost({ blockTag }),
+              provider!.getFeeData(),
+            ]);
+          const quote = (await pool
+            .quoteOracleRequest({ blockTag, gasPrice: feeData.gasPrice ?? 0n })
+            .catch(() => null)) as bigint | null;
+          return { reserve, locked, available, spent, required, cap, quote };
+        },
+        minimumBlock
+      ),
+    [provider]
+  );
+  const resource = useAsyncResource(load, refreshNonce, confirmation, 6000);
+  const data = resource.data;
+  function fund() {
+    if (
+      !signer ||
+      operation.busy ||
+      resource.loading ||
+      Boolean(resource.error) ||
+      !data
+    )
+      return;
+    void operation.run(async (progress) => {
       const pool = new Contract(
-        contractConfig.poolAddress,
+        contractConfig.poolAddress!,
         fairJackPoolAbi,
-        provider,
+        signer
       );
-      const [reserve, locked, available, spent, required, cap] =
-        await Promise.all([
-          pool.getOracleReserve(),
-          pool.lockedOracleBudget(),
-          pool.getAvailableOracleReserve(),
-          pool.totalOracleSpent(),
-          pool.getRequiredOracleBudget(),
-          pool.maxOracleRequestCost(),
-        ]);
-      const feeData = await provider.getFeeData();
-      const quote = (await pool
-        .quoteOracleRequest({ gasPrice: feeData.gasPrice ?? 0n })
-        .catch(() => null)) as bigint | null;
-      setData({
-        reserve,
-        locked,
-        available,
-        spent,
-        required,
-        cap,
-        quote,
-      });
-      setError(
-        quote === null
-          ? "Preventivo dell’oracolo temporaneamente non disponibile."
-          : null,
+      const value = parseEther(amount);
+      progress("Conferma nel wallet…", "wallet");
+      const confirmed = await confirmTransaction(
+        await pool.fundOracle({ value }),
+        progress
       );
-    } catch (cause) {
-      setError(readableError(cause));
-    }
-  }, [provider]);
-  useEffect(() => {
-    const timeout = window.setTimeout(() => {
-      void refresh();
-    }, 0);
-    const poll = window.setInterval(() => {
-      void refresh();
-    }, 6000);
-    return () => {
-      window.clearTimeout(timeout);
-      window.clearInterval(poll);
-    };
-  }, [refresh, refreshNonce]);
-  async function fund() {
-    if (!signer || !contractConfig.poolAddress) return;
-    try {
-      setPending(true);
-      setError(null);
-      setSuccess(null);
-      const pool = new Contract(
-        contractConfig.poolAddress,
-        fairJackPoolAbi,
-        signer,
-      );
-      const tx = await pool.fundOracle({ value: parseEther(amount) });
-      await tx.wait();
-      onTransactionConfirmed();
-      await refresh();
-      setSuccess(
-        "Riserva finanziata. Gli ETH sono destinati al servizio e non generano share.",
-      );
-    } catch (cause) {
-      setError(readableError(cause));
-    } finally {
-      setPending(false);
-    }
+      progress("Aggiornamento dati…", "syncing");
+      const updated = await resource.refresh(confirmed);
+      onTransactionConfirmed(confirmed);
+      if (updated)
+        operation.succeed(
+          "Riserva finanziata. Gli ETH sono destinati al servizio e non generano share."
+        );
+    });
   }
   const value = (key: keyof ReserveData) => {
     const amount = data?.[key];
     return amount == null ? "—" : `${formatEther(amount)} ETH`;
   };
   return (
-    <section>
+    <section aria-busy={operation.busy || resource.loading}>
       <div className="section-heading">
         <div>
           <span className="step">03</span>
@@ -153,6 +146,7 @@ export default function OraclePanel({
           ETH da destinare al servizio
           <input
             value={amount}
+            disabled={operation.busy}
             onChange={(event) => setAmount(event.target.value)}
             inputMode="decimal"
           />
@@ -160,9 +154,15 @@ export default function OraclePanel({
         <button
           type="button"
           onClick={() => void fund()}
-          disabled={!signer || pending}
+          disabled={
+            !signer ||
+            operation.busy ||
+            resource.loading ||
+            Boolean(resource.error) ||
+            !data
+          }
         >
-          {pending ? "Finanziamento…" : "Finanzia riserva"}
+          Finanzia riserva
         </button>
       </div>
       <p className="hint">
@@ -170,8 +170,12 @@ export default function OraclePanel({
         contribuire qualunque account; i player non devono finanziare ogni
         richiesta.
       </p>
-      {success && <p className="success">{success}</p>}
-      {error && <p className="error">{error}</p>}
+      <AsyncFeedback operation={operation} resource={resource} />
+      {data?.quote === null && (
+        <p className="hint">
+          Preventivo dell’oracolo temporaneamente non disponibile.
+        </p>
+      )}
     </section>
   );
 }

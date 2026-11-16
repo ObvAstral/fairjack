@@ -9,7 +9,13 @@ type ActionButtonsProps = {
   sessionBlocked: boolean;
   onAction: (
     action:
-      "hit" | "stand" | "timeout" | "process" | "request" | "fulfill" | "time",
+      | "hit"
+      | "stand"
+      | "timeout"
+      | "process"
+      | "request"
+      | "fulfill"
+      | "time"
   ) => void;
   onRefresh: () => void;
 };
@@ -104,7 +110,7 @@ export default function ActionButtons({
           onClick={onRefresh}
           disabled={busy}
         >
-          Aggiorna partita
+          {pending === "refresh" ? "Aggiornamento…" : "Aggiorna partita"}
         </button>
       </div>
     </div>

@@ -1,5 +1,12 @@
 import { BrowserProvider, Contract } from "ethers";
-import { lazy, Suspense, useCallback, useEffect, useState } from "react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import ConnectWallet from "./components/ConnectWallet";
 import GameBoard from "./components/GameBoard";
 import PoolPanel from "./components/PoolPanel";
@@ -12,9 +19,13 @@ import type { WalletState } from "./types/wallet";
 import { readableError } from "./utils/errors";
 import { createWalletSigner } from "./utils/walletSigner";
 import SessionPanel from "./components/SessionPanel";
+import LoadingStatus from "./components/LoadingStatus";
+import { readSnapshot, type Confirmation } from "./utils/async";
 import "./App.css";
 
-const GameSessionProvider = lazy(() => import("./components/GameSessionProvider"));
+const GameSessionProvider = lazy(
+  () => import("./components/GameSessionProvider")
+);
 
 export default function App() {
   const [wallet, setWallet] = useState<WalletState>({
@@ -23,6 +34,21 @@ export default function App() {
     account: null,
     chainId: null,
   });
+  const activeProvider = useRef<BrowserProvider | null>(null);
+  useEffect(() => {
+    activeProvider.current = wallet.provider;
+    return () => {
+      activeProvider.current = null;
+    };
+  }, [wallet.provider]);
+  const walletLock = useRef(false),
+    switchLock = useRef(false),
+    walletVersion = useRef(0);
+  const [switching, setSwitching] = useState(false);
+  const [validatedProvider, setValidatedProvider] =
+    useState<BrowserProvider | null>(null);
+  const [confirmation, setConfirmation] = useState<Confirmation | undefined>();
+  const [selection, setSelection] = useState({ revision: 0, explicit: false });
   const [connecting, setConnecting] = useState(false);
   const [walletError, setWalletError] = useState<string | null>(null);
   const [deploymentError, setDeploymentError] = useState<string | null>(null);
@@ -34,12 +60,16 @@ export default function App() {
       setWalletError("MetaMask o un wallet EIP-1193 non è disponibile.");
       return;
     }
+    if (requestAccess && walletLock.current) return;
+    if (requestAccess) walletLock.current = true;
+    const version = ++walletVersion.current;
     try {
       setConnecting(true);
       setWalletError(null);
       const accounts = (await window.ethereum.request({
         method: requestAccess ? "eth_requestAccounts" : "eth_accounts",
       })) as string[];
+      if (version !== walletVersion.current) return;
       if (accounts.length === 0) {
         setWallet({
           provider: null,
@@ -52,6 +82,8 @@ export default function App() {
       const provider = new BrowserProvider(window.ethereum);
       const signer = await createWalletSigner(provider, accounts[0]);
       const network = await provider.getNetwork();
+      if (version !== walletVersion.current) return;
+      setConfirmation(undefined);
       setWallet({
         provider,
         signer,
@@ -59,56 +91,67 @@ export default function App() {
         chainId: network.chainId,
       });
     } catch (cause) {
-      setWalletError(readableError(cause));
+      if (version === walletVersion.current)
+        setWalletError(readableError(cause));
     } finally {
-      setConnecting(false);
+      if (requestAccess) walletLock.current = false;
+      if (version === walletVersion.current) setConnecting(false);
     }
   }, []);
 
   const connect = useCallback(async () => syncWallet(true), [syncWallet]);
 
   const switchNetwork = useCallback(async () => {
-    if (!window.ethereum) return;
+    if (!window.ethereum || switchLock.current) return;
+    switchLock.current = true;
+    setSwitching(true);
     const chainId = `0x${contractConfig.expectedChainId.toString(16)}`;
     try {
-      setWalletError(null);
-      await window.ethereum.request({
-        method: "wallet_switchEthereumChain",
-        params: [{ chainId }],
-      });
-    } catch (cause) {
-      const code =
-        typeof cause === "object" && cause !== null && "code" in cause
-          ? Number((cause as { code: unknown }).code)
-          : null;
-      if (code !== 4902) {
-        setWalletError(readableError(cause));
-        return;
-      }
       try {
+        setWalletError(null);
         await window.ethereum.request({
-          method: "wallet_addEthereumChain",
-          params: [
-            {
-              chainId,
-              chainName: contractConfig.networkName,
-              nativeCurrency: {
-                name: contractConfig.nativeCurrencyName,
-                symbol: contractConfig.nativeCurrencySymbol,
-                decimals: 18,
-              },
-              rpcUrls: [contractConfig.rpcUrl],
-              ...(contractConfig.blockExplorerUrl
-                ? { blockExplorerUrls: [contractConfig.blockExplorerUrl] }
-                : {}),
-            },
-          ],
+          method: "wallet_switchEthereumChain",
+          params: [{ chainId }],
         });
-      } catch (addCause) {
-        setWalletError(readableError(addCause));
+      } catch (cause) {
+        const code =
+          typeof cause === "object" && cause !== null && "code" in cause
+            ? Number((cause as { code: unknown }).code)
+            : null;
+        if (code !== 4902) {
+          setWalletError(readableError(cause));
+          return;
+        }
+        try {
+          await window.ethereum.request({
+            method: "wallet_addEthereumChain",
+            params: [
+              {
+                chainId,
+                chainName: contractConfig.networkName,
+                nativeCurrency: {
+                  name: contractConfig.nativeCurrencyName,
+                  symbol: contractConfig.nativeCurrencySymbol,
+                  decimals: 18,
+                },
+                rpcUrls: [contractConfig.rpcUrl],
+                ...(contractConfig.blockExplorerUrl
+                  ? { blockExplorerUrls: [contractConfig.blockExplorerUrl] }
+                  : {}),
+              },
+            ],
+          });
+        } catch (addCause) {
+          setWalletError(readableError(addCause));
+          return;
+        }
       }
+      await syncWallet(false);
+    } finally {
+      switchLock.current = false;
+      setSwitching(false);
     }
-  }, []);
+  }, [syncWallet]);
 
   useEffect(() => {
     const ethereum = window.ethereum;
@@ -139,49 +182,86 @@ export default function App() {
       return () => window.clearTimeout(timeout);
     }
     let active = true;
-    void Promise.all([
-      wallet.provider.getCode(contractConfig.tokenAddress),
-      wallet.provider.getCode(contractConfig.poolAddress),
-      new Contract(
-        contractConfig.poolAddress,
-        fairJackPoolAbi,
-        wallet.provider,
-      ).vrfWrapper(),
-    ])
-      .then(([tokenCode, poolCode]) => {
+    const controller = new AbortController();
+    void readSnapshot(
+      wallet.provider,
+      controller.signal,
+      undefined,
+      (blockTag) =>
+        Promise.all([
+          wallet.provider!.getCode(contractConfig.tokenAddress!, blockTag),
+          wallet.provider!.getCode(contractConfig.poolAddress!, blockTag),
+          new Contract(
+            contractConfig.poolAddress!,
+            fairJackPoolAbi,
+            wallet.provider!
+          ).vrfWrapper({ blockTag }),
+        ])
+    )
+      .then(({ data: [tokenCode, poolCode] }) => {
         if (!active) return;
+        setValidatedProvider(wallet.provider);
         setDeploymentError(
           tokenCode === "0x" || poolCode === "0x"
             ? "Gli indirizzi configurati non contengono contratti su questa chain. Verifica il deploy e la configurazione del frontend."
-            : null,
+            : null
         );
       })
       .catch((cause: unknown) => {
-        if (active)
+        if (active) {
+          setValidatedProvider(wallet.provider);
           setDeploymentError(
             `Il contratto configurato non risponde come FairJack VRF. Verifica il nuovo deploy e gli indirizzi. ${readableError(
-              cause,
-            )}`,
+              cause
+            )}`
           );
+        }
       });
     return () => {
       active = false;
+      controller.abort();
     };
   }, [wallet.chainId, wallet.provider]);
 
+  const onConfirmed = useCallback(
+    (confirmed?: Confirmation) => {
+      if (activeProvider.current !== wallet.provider) return;
+      if (confirmed)
+        setConfirmation((previous) =>
+          previous?.blockNumber &&
+          confirmed.blockNumber &&
+          previous.blockNumber > confirmed.blockNumber
+            ? previous
+            : confirmed
+        );
+      setRefreshNonce((value) => value + 1);
+    },
+    [wallet.provider]
+  );
+  const selectGame = (gameId: bigint) => {
+    setSelectedGameId(gameId);
+    setSelection((previous) => ({
+      revision: previous.revision + 1,
+      explicit: true,
+    }));
+  };
   const panelProps = {
     ...wallet,
     refreshNonce,
-    onTransactionConfirmed: () => setRefreshNonce((value) => value + 1),
+    confirmation,
+    onTransactionConfirmed: onConfirmed,
   };
 
   const correctNetwork = wallet.chainId === contractConfig.expectedChainId;
   const localNetwork = contractConfig.expectedChainId === 31337n;
   const appReady = Boolean(
     wallet.account &&
-    correctNetwork &&
-    contractConfig.errors.length === 0 &&
-    !deploymentError,
+      correctNetwork &&
+      contractConfig.errors.length === 0 &&
+      validatedProvider === wallet.provider &&
+      !connecting &&
+      !switching &&
+      !deploymentError
   );
 
   return (
@@ -204,7 +284,7 @@ export default function App() {
         </aside>
       )}
 
-      {deploymentError && (
+      {deploymentError && validatedProvider === wallet.provider && (
         <aside className="config-warning">
           <strong>Deploy non trovato</strong>
           <span>{deploymentError}</span>
@@ -215,22 +295,30 @@ export default function App() {
         account={wallet.account}
         chainId={wallet.chainId}
         connecting={connecting}
+        switching={switching}
         error={walletError}
         expectedChainId={contractConfig.expectedChainId}
         networkName={contractConfig.networkName}
         onConnect={() => void connect()}
-        onClear={() =>
+        onClear={() => {
+          ++walletVersion.current;
+          setConnecting(false);
           setWallet({
             provider: null,
             signer: null,
             account: null,
             chainId: null,
-          })
-        }
+          });
+        }}
         onSwitchNetwork={() => void switchNetwork()}
       />
 
-      {!wallet.account && (
+      {wallet.account &&
+        correctNetwork &&
+        validatedProvider !== wallet.provider &&
+        !connecting && <LoadingStatus>Verifica dei contratti…</LoadingStatus>}
+
+      {!wallet.account && !connecting && (
         <div className="empty-state">
           <strong>Connetti il wallet per iniziare.</strong>
           <span>
@@ -251,63 +339,75 @@ export default function App() {
       )}
 
       {appReady && (
-        <Suspense fallback={<p className="hint">Caricamento delle sessioni…</p>}>
-        <GameSessionProvider key={`${wallet.chainId}:${wallet.account}`} wallet={wallet} onConfirmed={panelProps.onTransactionConfirmed}>
-          <SessionPanel />
-          <div className="dashboard-grid">
-            <TokenPanel {...panelProps} />
-            <PoolPanel {...panelProps} />
-            <OraclePanel {...panelProps} />
-            <StartGame
+        <Suspense
+          fallback={<LoadingStatus>Caricamento delle sessioni…</LoadingStatus>}
+        >
+          <GameSessionProvider
+            key={`${wallet.chainId}:${wallet.account}`}
+            wallet={wallet}
+            onConfirmed={panelProps.onTransactionConfirmed}
+          >
+            <SessionPanel />
+            <div className="dashboard-grid">
+              <TokenPanel {...panelProps} />
+              <PoolPanel {...panelProps} />
+              <OraclePanel {...panelProps} />
+              <StartGame
+                {...panelProps}
+                onGameStarted={(gameId) => {
+                  if (activeProvider.current !== wallet.provider) return;
+                  selectGame(gameId);
+                  window.setTimeout(
+                    () =>
+                      document
+                        .querySelector(".game-section")
+                        ?.scrollIntoView({ behavior: "smooth" }),
+                    100
+                  );
+                }}
+              />
+            </div>
+            <GameBoard
               {...panelProps}
-              onGameStarted={(gameId) => {
-                setSelectedGameId(gameId);
-                window.setTimeout(
-                  () =>
-                    document
-                      .querySelector(".game-section")
-                      ?.scrollIntoView({ behavior: "smooth" }),
-                  100,
-                );
-              }}
+              selectedGameId={selectedGameId}
+              selectionRevision={selection.revision}
+              selectionExplicit={selection.explicit}
+              onSelectGame={selectGame}
             />
-          </div>
-          <GameBoard
-            {...panelProps}
-            selectedGameId={selectedGameId}
-            onSelectGame={setSelectedGameId}
-          />
-          <details className="test-guide">
-            <summary>Checklist rapida per il collaudo</summary>
-            <ol>
-              <li>
-                Mint e allowance per player e staker; deposita FJT nella house
-                pool.
-              </li>
-              <li>
-                Finanzia la riserva ETH dell’oracolo: è un contributo separato
-                dalle share.
-              </li>
-              <li>Apri una sessione e crea una partita. La pool paga VRF, il relayer paga il gas delle mosse.</li>
-              <li>
-                {localNetwork
-                  ? "Il dealer simula la risposta locale ed elabora le carte automaticamente."
-                  : "Attendi Chainlink VRF: il dealer elabora automaticamente le carte."}
-              </li>
-              <li>
-                Ogni Hit richiede una nuova risposta. Stand richiede randomness
-                solo se il dealer deve pescare.
-              </li>
-              <li>
-                Per il timeout del player,{" "}
-                {localNetwork
-                  ? "usa “Supera deadline” durante il suo turno."
-                  : "attendi la scadenza durante il suo turno."}{" "}
-                L’attesa dell’oracolo non penalizza il player.
-              </li>
-            </ol>
-          </details>
-        </GameSessionProvider>
+            <details className="test-guide">
+              <summary>Checklist rapida per il collaudo</summary>
+              <ol>
+                <li>
+                  Mint e allowance per player e staker; deposita FJT nella house
+                  pool.
+                </li>
+                <li>
+                  Finanzia la riserva ETH dell’oracolo: è un contributo separato
+                  dalle share.
+                </li>
+                <li>
+                  Apri una sessione e crea una partita. La pool paga VRF, il
+                  relayer paga il gas delle mosse.
+                </li>
+                <li>
+                  {localNetwork
+                    ? "Il dealer simula la risposta locale ed elabora le carte automaticamente."
+                    : "Attendi Chainlink VRF: il dealer elabora automaticamente le carte."}
+                </li>
+                <li>
+                  Ogni Hit richiede una nuova risposta. Stand richiede
+                  randomness solo se il dealer deve pescare.
+                </li>
+                <li>
+                  Per il timeout del player,{" "}
+                  {localNetwork
+                    ? "usa “Supera deadline” durante il suo turno."
+                    : "attendi la scadenza durante il suo turno."}{" "}
+                  L’attesa dell’oracolo non penalizza il player.
+                </li>
+              </ol>
+            </details>
+          </GameSessionProvider>
         </Suspense>
       )}
     </main>

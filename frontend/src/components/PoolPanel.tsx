@@ -1,20 +1,18 @@
 import { Contract, formatUnits, parseUnits } from "ethers";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useState } from "react";
 import { fairJackPoolAbi, mockTokenAbi } from "../contracts/abis";
 import { contractConfig } from "../config/contracts";
 import type { PanelProps } from "../types/wallet";
-import { readableError } from "../utils/errors";
+import {
+  confirmTransaction,
+  readSnapshot,
+  type Confirmation,
+} from "../utils/async";
+import { useAsyncResource } from "../utils/useAsyncResource";
+import { useOperation } from "../utils/useOperation";
+import AsyncFeedback from "./AsyncFeedback";
 
-type PoolData = {
-  balance: string;
-  locked: string;
-  available: string;
-  shares: string;
-  sharePrice: string;
-  totalShares: string;
-};
-
-const emptyData: PoolData = {
+const emptyData = {
   balance: "—",
   locked: "—",
   available: "—",
@@ -22,107 +20,101 @@ const emptyData: PoolData = {
   sharePrice: "—",
   totalShares: "—",
 };
-
 export default function PoolPanel({
   provider,
   signer,
   account,
   refreshNonce,
+  confirmation,
   onTransactionConfirmed,
 }: PanelProps) {
-  const [data, setData] = useState<PoolData>(emptyData);
-  const [decimals, setDecimals] = useState(18);
-  const [depositAmount, setDepositAmount] = useState("10");
-  const [withdrawShares, setWithdrawShares] = useState("10");
-  const [pending, setPending] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [success, setSuccess] = useState<string | null>(null);
-
-  const refresh = useCallback(async () => {
-    if (
-      !provider ||
-      !account ||
-      !contractConfig.poolAddress ||
-      !contractConfig.tokenAddress
-    )
-      return;
-    try {
+  const [depositAmount, setDepositAmount] = useState("10"),
+    [withdrawShares, setWithdrawShares] = useState("10");
+  const operation = useOperation();
+  const load = useCallback(
+    (signal: AbortSignal, confirmed?: Confirmation, minimumBlock?: number) =>
+      readSnapshot(
+        provider!,
+        signal,
+        confirmed,
+        async (blockTag) => {
+          const pool = new Contract(
+            contractConfig.poolAddress!,
+            fairJackPoolAbi,
+            provider!
+          );
+          const token = new Contract(
+            contractConfig.tokenAddress!,
+            mockTokenAbi,
+            provider!
+          );
+          const [
+            decimals,
+            balance,
+            locked,
+            available,
+            shares,
+            sharePrice,
+            totalShares,
+          ] = await Promise.all([
+            token.decimals({ blockTag }),
+            pool.poolBalance({ blockTag }),
+            pool.lockedLiquidity({ blockTag }),
+            pool.getAvailableLiquidity({ blockTag }),
+            pool.sharesOf(account, { blockTag }),
+            pool.getSharePrice({ blockTag }),
+            pool.totalShares({ blockTag }),
+          ]);
+          return {
+            decimals: Number(decimals),
+            balance: formatUnits(balance, decimals),
+            locked: formatUnits(locked, decimals),
+            available: formatUnits(available, decimals),
+            shares: formatUnits(shares, decimals),
+            sharePrice: formatUnits(sharePrice, 18),
+            totalShares: formatUnits(totalShares, decimals),
+          };
+        },
+        minimumBlock
+      ),
+    [account, provider]
+  );
+  const resource = useAsyncResource(load, refreshNonce, confirmation);
+  const data = resource.data ?? emptyData;
+  const blocked =
+    operation.busy ||
+    resource.loading ||
+    Boolean(resource.error) ||
+    !resource.data;
+  function transact(action: "deposit" | "withdraw") {
+    if (!signer || blocked) return;
+    void operation.run(async (progress) => {
       const pool = new Contract(
-        contractConfig.poolAddress,
+        contractConfig.poolAddress!,
         fairJackPoolAbi,
-        provider,
-      );
-      const token = new Contract(
-        contractConfig.tokenAddress,
-        mockTokenAbi,
-        provider,
-      );
-      const tokenDecimals = Number(await token.decimals());
-      const [balance, locked, available, shares, sharePrice, totalShares] =
-        await Promise.all([
-          pool.poolBalance(),
-          pool.lockedLiquidity(),
-          pool.getAvailableLiquidity(),
-          pool.sharesOf(account),
-          pool.getSharePrice(),
-          pool.totalShares(),
-        ]);
-      setDecimals(tokenDecimals);
-      setData({
-        balance: formatUnits(balance, tokenDecimals),
-        locked: formatUnits(locked, tokenDecimals),
-        available: formatUnits(available, tokenDecimals),
-        shares: formatUnits(shares, tokenDecimals),
-        sharePrice: formatUnits(sharePrice, 18),
-        totalShares: formatUnits(totalShares, tokenDecimals),
-      });
-      setError(null);
-    } catch (cause) {
-      setError(readableError(cause));
-    }
-  }, [account, provider]);
-
-  useEffect(() => {
-    const timeout = window.setTimeout(() => {
-      void refresh();
-    }, 0);
-    return () => window.clearTimeout(timeout);
-  }, [refresh, refreshNonce]);
-
-  async function transact(action: "deposit" | "withdraw") {
-    if (!signer || !contractConfig.poolAddress) return;
-    try {
-      setPending(action);
-      setError(null);
-      setSuccess(null);
-      const pool = new Contract(
-        contractConfig.poolAddress,
-        fairJackPoolAbi,
-        signer,
+        signer
       );
       const value = parseUnits(
         action === "deposit" ? depositAmount : withdrawShares,
-        decimals,
+        resource.data!.decimals
       );
+      progress("Conferma nel wallet…", "wallet");
       const tx =
         action === "deposit"
           ? await pool.depositToHousePool(value)
           : await pool.withdrawFromHousePool(value);
-      await tx.wait();
-      await refresh();
-      onTransactionConfirmed();
-      setSuccess(
-        action === "deposit" ? "Deposito confermato." : "Prelievo confermato.",
-      );
-    } catch (cause) {
-      setError(readableError(cause));
-    } finally {
-      setPending(null);
-    }
+      const confirmed = await confirmTransaction(tx, progress);
+      progress("Aggiornamento dati…", "syncing");
+      const updated = await resource.refresh(confirmed);
+      onTransactionConfirmed(confirmed);
+      if (updated)
+        operation.succeed(
+          action === "deposit" ? "Deposito confermato." : "Prelievo confermato."
+        );
+    });
   }
-
   return (
-    <section>
+    <section aria-busy={operation.busy || resource.loading}>
       <div className="section-heading">
         <div>
           <span className="step">02</span>
@@ -161,6 +153,7 @@ export default function PoolPanel({
           Token da depositare
           <input
             value={depositAmount}
+            disabled={operation.busy}
             onChange={(event) => setDepositAmount(event.target.value)}
             inputMode="decimal"
           />
@@ -168,14 +161,15 @@ export default function PoolPanel({
         <button
           type="button"
           onClick={() => void transact("deposit")}
-          disabled={!signer || !!pending}
+          disabled={!signer || blocked}
         >
-          {pending === "deposit" ? "Deposito…" : "Deposita"}
+          Deposita
         </button>
         <label>
           Shares da ritirare
           <input
             value={withdrawShares}
+            disabled={operation.busy}
             onChange={(event) => setWithdrawShares(event.target.value)}
             inputMode="decimal"
           />
@@ -183,9 +177,9 @@ export default function PoolPanel({
         <button
           type="button"
           onClick={() => void transact("withdraw")}
-          disabled={!signer || !!pending}
+          disabled={!signer || blocked}
         >
-          {pending === "withdraw" ? "Prelievo…" : "Ritira"}
+          Ritira
         </button>
       </div>
       <p className="hint">
@@ -196,13 +190,12 @@ export default function PoolPanel({
       <button
         type="button"
         className="secondary"
-        onClick={() => void refresh()}
-        disabled={!provider}
+        onClick={() => void resource.refresh()}
+        disabled={!provider || operation.busy || resource.loading}
       >
         Aggiorna dati pool
       </button>
-      {success && <p className="success">{success}</p>}
-      {error && <p className="error">{error}</p>}
+      <AsyncFeedback operation={operation} resource={resource} />
     </section>
   );
 }

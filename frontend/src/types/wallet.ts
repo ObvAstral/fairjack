@@ -1,4 +1,5 @@
 import type { BrowserProvider, JsonRpcSigner } from "ethers";
+import type { Confirmation } from "../utils/async";
 
 export type WalletState = {
   provider: BrowserProvider | null;
@@ -9,5 +10,6 @@ export type WalletState = {
 
 export type PanelProps = WalletState & {
   refreshNonce: number;
-  onTransactionConfirmed: () => void;
+  confirmation?: Confirmation;
+  onTransactionConfirmed: (confirmation?: Confirmation) => void;
 };

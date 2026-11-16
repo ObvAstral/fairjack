@@ -29,4 +29,12 @@ un nuovo deploy. Per l'hosting, il backend può servire `frontend/dist` sulla
 stessa origine delle API; configurazione completa nel README della root.
 
 Dalla root, `npm run abi:sync` aggiorna le ABI dai contratti compilati.
-Per verificare il frontend: `npm run build` e `npm run lint`.
+Ogni pannello mostra l’attesa del wallet, della conferma e dell’aggiornamento dati.
+Dopo la conferma, le letture usano un blocco almeno pari a quello della transazione.
+Se la sincronizzazione non riesce entro 30 secondi, “Riprova aggiornamento” ripete
+soltanto le letture; per un invio relayer incerto resta disponibile “Verifica
+operazione”. Il polling conserva i dati visibili e non attiva il caricamento.
+
+Per verificare il frontend: `npm run build`, `npm run lint` e `npm test`.
+I test frontend simulano latenze RPC, creazione wallet/relayer, selezioni fuori
+ordine, rifiuti e recupero dagli errori con Vitest e React Testing Library.
